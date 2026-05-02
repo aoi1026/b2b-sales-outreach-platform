@@ -18,12 +18,14 @@
     "db:studio": "npm run studio --workspace=@mvp/db",
     "db:seed": "npm run seed --workspace=@mvp/db",
     "start:admin": "npm run start --workspace=@mvp/admin",
-    "start:lp":    "npm run start --workspace=@mvp/lp",
-    "start":       "concurrently -n admin,lp -c blue,green \"npm:start:admin\" \"npm:start:lp\""
-
-
+    "start:lp": "npm run start --workspace=@mvp/lp",
+    "start": "concurrently -n admin,lp -c blue,green \"npm:start:admin\" \"npm:start:lp\""
   },
   "devDependencies": {
     "concurrently": "^9.2.1"
+  },
+  "dependencies": {
+    "@prisma/client": "^7.8.0",
+    "prisma": "^7.8.0"
   }
 }
