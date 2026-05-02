@@ -4,7 +4,8 @@
   "private": true,
   "scripts": {
     "dev": "dotenv -e ../../.env -- next dev --turbo -p 3002",
-    "build": "dotenv -e ../../.env -- next build",
+    "build": "prisma generate --schema=../../packages/db/prisma/schema.prisma && next build",
+    "build:local": "dotenv -e ../../.env -- npm run build",
     "start": "dotenv -e ../../.env -- next start -p 3002",
     "lint": "next lint",
     "typecheck": "tsc --noEmit"
@@ -31,6 +32,7 @@
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "postcss": "^8.4.49",
+    "prisma": "^6.1.0",
     "tailwindcss": "^4.0.0",
     "typescript": "^5.7.2"
   }
