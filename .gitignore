@@ -1,0 +1,58 @@
+# dependencies
+node_modules/
+.pnp
+.pnp.*
+.yarn/*
+
+# testing
+coverage/
+
+# next.js
+.next/
+out/
+build/
+dist/
+
+# prisma generated
+**/generated/
+**/*.generated.*
+
+# env
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# OS
+Thumbs.db
+
+# misc
+*.tmp
+
+# LP dummy form received log (dev only)
+apps/lp/.received-log.jsonl
+
+# private negotiation / personal notes
+*_chatting listr.txt
+*_chat_history.txt
+
+# Local-only requirement docs (client-shared, not repo artifacts)
+マイルストーン1_要件整理.xlsx
+マイルストーン1_最終要件定義書.md
+白石様_lancers offe_chatting listr.txt

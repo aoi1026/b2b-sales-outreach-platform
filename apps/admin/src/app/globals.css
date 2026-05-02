@@ -1,0 +1,21 @@
+@import "tailwindcss";
+
+@theme {
+  --color-brand-sidebar: #1f2a34;
+  --color-brand-sidebar-active: #2b3a48;
+  --color-brand-primary: #1e5ab4;
+  --color-brand-accent: #dc2626;
+  --font-family-sans: system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Yu Gothic UI", sans-serif;
+}
+
+html,
+body {
+  height: 100%;
+  background-color: #f7f8fa;
+  color: #1a1a1a;
+  font-family: var(--font-family-sans);
+}
+
+* {
+  box-sizing: border-box;
+}

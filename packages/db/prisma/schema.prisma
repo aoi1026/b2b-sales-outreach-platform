@@ -1,0 +1,259 @@
+// MVP Business Optimize System - Prisma schema
+// MS2: User + Case
+// MS3: List / Company / MessageTemplate / SenderTemplate / BlacklistEntry + pivots
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum CaseStatus {
+  PREPARING   // 準備中
+  RUNNING     // 配信中
+  COMPLETED   // 完了
+  STOPPED     // 停止
+}
+
+enum BlacklistType {
+  DOMAIN
+  COMPANY_NAME
+}
+
+enum BlacklistSource {
+  MANUAL
+  AUTO_KEYWORD
+}
+
+enum DeliveryJobStatus {
+  PENDING    // 作成済・未開始
+  RUNNING    // 実行中
+  PAUSED     // 一時停止
+  DONE       // 全件完了
+  FAILED     // 致命的エラーで停止
+  CANCELLED  // ユーザによる中止
+}
+
+enum DeliveryResultStatus {
+  PENDING    // 未処理
+  RUNNING    // 処理中
+  SUCCESS    // 送信成功
+  FAILED     // 送信失敗
+  SKIPPED    // BL等でスキップ
+}
+
+enum DeliveryErrorType {
+  TIMEOUT
+  FORM_NOT_FOUND
+  FIELD_MISMATCH
+  SUBMIT_FAILED
+  VALIDATION_ERROR
+  BLACKLISTED
+  NETWORK_ERROR
+  UNKNOWN
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  name         String
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  cases Case[]
+
+  @@map("users")
+}
+
+model Case {
+  id        String     @id @default(cuid())
+  name      String
+  sponsor   String
+  genre     String?
+  startDate DateTime?  @map("start_date")
+  endDate   DateTime?  @map("end_date")
+  status    CaseStatus @default(PREPARING)
+  memo      String?
+  ownerId   String     @map("owner_id")
+  owner     User       @relation(fields: [ownerId], references: [id])
+  createdAt DateTime   @default(now()) @map("created_at")
+  updatedAt DateTime   @updatedAt @map("updated_at")
+
+  caseLists     CaseList[]
+  caseTemplates CaseTemplate[]
+  deliveryJobs  DeliveryJob[]
+
+  @@index([ownerId])
+  @@index([status])
+  @@map("cases")
+}
+
+model List {
+  id          String    @id @default(cuid())
+  name        String
+  description String?
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  companies    Company[]
+  caseLists    CaseList[]
+  deliveryJobs DeliveryJob[]
+
+  @@map("lists")
+}
+
+model Company {
+  id        String   @id @default(cuid())
+  listId    String   @map("list_id")
+  list      List     @relation(fields: [listId], references: [id], onDelete: Cascade)
+  name      String
+  formUrl   String   @map("form_url")
+  siteUrl   String?  @map("site_url")
+  email     String?
+  industry  String?
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  deliveryResults DeliveryResult[]
+
+  @@index([listId])
+  @@map("companies")
+}
+
+model MessageTemplate {
+  id        String   @id @default(cuid())
+  name      String
+  subject   String
+  body      String   @db.Text
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  caseTemplates CaseTemplate[]
+  deliveryJobs  DeliveryJob[]
+
+  @@map("message_templates")
+}
+
+model SenderTemplate {
+  id          String   @id @default(cuid())
+  name        String
+  companyName String   @map("company_name")
+  personName  String   @map("person_name")
+  email       String
+  phone       String?
+  postalCode  String?  @map("postal_code")
+  address     String?
+  url         String?
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  caseTemplates CaseTemplate[]
+  deliveryJobs  DeliveryJob[]
+
+  @@map("sender_templates")
+}
+
+model BlacklistEntry {
+  id        String          @id @default(cuid())
+  type      BlacklistType
+  value     String
+  reason    String?
+  source    BlacklistSource @default(MANUAL)
+  createdAt DateTime        @default(now()) @map("created_at")
+
+  @@unique([type, value])
+  @@index([type])
+  @@map("blacklist_entries")
+}
+
+model CaseList {
+  caseId    String   @map("case_id")
+  listId    String   @map("list_id")
+  case      Case     @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  list      List     @relation(fields: [listId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@id([caseId, listId])
+  @@index([listId])
+  @@map("case_lists")
+}
+
+model Setting {
+  key       String   @id
+  value     String   @db.Text
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("settings")
+}
+
+model DeliveryJob {
+  id                String            @id @default(cuid())
+  caseId            String            @map("case_id")
+  listId            String            @map("list_id")
+  messageTemplateId String            @map("message_template_id")
+  senderTemplateId  String?           @map("sender_template_id")
+  status            DeliveryJobStatus @default(PENDING)
+  plannedCount      Int               @default(0) @map("planned_count")
+  successCount      Int               @default(0) @map("success_count")
+  failedCount       Int               @default(0) @map("failed_count")
+  skippedCount      Int               @default(0) @map("skipped_count")
+  pauseRequested    Boolean           @default(false) @map("pause_requested")
+  cancelRequested   Boolean           @default(false) @map("cancel_requested")
+  note              String?
+  createdAt         DateTime          @default(now()) @map("created_at")
+  updatedAt         DateTime          @updatedAt @map("updated_at")
+  startedAt         DateTime?         @map("started_at")
+  completedAt       DateTime?         @map("completed_at")
+
+  case            Case             @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  list            List             @relation(fields: [listId], references: [id], onDelete: Cascade)
+  messageTemplate MessageTemplate  @relation(fields: [messageTemplateId], references: [id], onDelete: Restrict)
+  senderTemplate  SenderTemplate?  @relation(fields: [senderTemplateId], references: [id], onDelete: SetNull)
+  results         DeliveryResult[]
+
+  @@index([caseId])
+  @@index([status])
+  @@map("delivery_jobs")
+}
+
+model DeliveryResult {
+  id           String               @id @default(cuid())
+  jobId        String               @map("job_id")
+  companyId    String               @map("company_id")
+  status       DeliveryResultStatus @default(PENDING)
+  errorType    DeliveryErrorType?   @map("error_type")
+  errorMessage String?              @map("error_message") @db.Text
+  httpStatus   Int?                 @map("http_status")
+  attempts     Int                  @default(0)
+  attemptedAt  DateTime?            @map("attempted_at")
+  createdAt    DateTime             @default(now()) @map("created_at")
+  updatedAt    DateTime             @updatedAt @map("updated_at")
+
+  job     DeliveryJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  company Company     @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([jobId, companyId])
+  @@index([jobId])
+  @@index([status])
+  @@map("delivery_results")
+}
+
+model CaseTemplate {
+  caseId            String   @map("case_id")
+  messageTemplateId String   @map("message_template_id")
+  senderTemplateId  String?  @map("sender_template_id")
+  case              Case            @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  messageTemplate   MessageTemplate @relation(fields: [messageTemplateId], references: [id], onDelete: Cascade)
+  senderTemplate    SenderTemplate? @relation(fields: [senderTemplateId], references: [id], onDelete: SetNull)
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  @@id([caseId, messageTemplateId])
+  @@index([messageTemplateId])
+  @@index([senderTemplateId])
+  @@map("case_templates")
+}
