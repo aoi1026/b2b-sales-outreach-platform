@@ -11,7 +11,7 @@
     "dev:lp": "npm run dev --workspace=@mvp/lp",
     "dev:worker": "npm run dev --workspace=@mvp/worker",
     "dev": "concurrently -n admin,lp,worker -c blue,green,magenta \"npm:dev:admin\" \"npm:dev:lp\" \"npm:dev:worker\"",
-    "build": "npm run build --workspaces --if-present",
+    "build": "npm run db:generate && npm run build --workspace=@mvp/admin",
     "db:generate": "npm run generate --workspace=@mvp/db",
     "db:migrate": "npm run migrate --workspace=@mvp/db",
     "db:push": "npm run db:push --workspace=@mvp/db",
