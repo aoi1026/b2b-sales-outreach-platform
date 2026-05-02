@@ -8,7 +8,7 @@
     "build:local": "dotenv -e ../../.env -- npm run build",
     "start": "dotenv -e ../../.env -- next start -p 3002",
     "lint": "next lint",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "prisma generate --schema=../../packages/db/prisma/schema.prisma && tsc --noEmit"
   },
   "dependencies": {
     "@mvp/db": "*",
