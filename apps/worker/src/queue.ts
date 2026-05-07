@@ -11,8 +11,10 @@ export async function getBoss(): Promise<PgBoss> {
   bossInstance = new PgBoss({
     connectionString,
     schema: "pgboss",
-    retryLimit: 2,
-    retryDelay: 30,
+    // pg-boss 側の自動リトライは無効化。各社の3回リトライは worker 内で行う
+    retryLimit: 0,
+    // ジョブ期限切れによる二重起動を防ぐためデフォルトを延長
+    expireInHours: 4,
     // Supabase Free tier の session pool (15) を圧迫しないため最小化
     max: 2,
     // pg-boss のメンテナンス系を控えめに (接続消費を抑える)

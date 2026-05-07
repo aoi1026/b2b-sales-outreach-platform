@@ -83,11 +83,32 @@ export async function resumeJobAction(jobId: string): Promise<void> {
 export async function cancelJobAction(jobId: string): Promise<void> {
   const user = await requireUser();
   if (!user) return;
-  await prisma.deliveryJob.update({
+
+  const job = await prisma.deliveryJob.findUnique({
     where: { id: jobId },
-    data: { cancelRequested: true },
+    select: { status: true },
   });
+  if (!job) return;
+
+  if (job.status === "PENDING" || job.status === "PAUSED") {
+    // Worker が処理に入っていないのでその場で確定させる
+    await prisma.deliveryJob.update({
+      where: { id: jobId },
+      data: {
+        status: "CANCELLED",
+        cancelRequested: true,
+        completedAt: new Date(),
+      },
+    });
+  } else {
+    // RUNNING は Worker が次の会社の処理前にフラグを検知して止まる
+    await prisma.deliveryJob.update({
+      where: { id: jobId },
+      data: { cancelRequested: true },
+    });
+  }
   revalidatePath(`/send/${jobId}`);
+  revalidatePath("/send");
 }
 
 export async function deleteJobAction(
