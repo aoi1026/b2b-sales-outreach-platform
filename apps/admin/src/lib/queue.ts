@@ -7,9 +7,17 @@ const g = globalThis as any;
 
 async function getBoss(): Promise<PgBoss> {
   if (g.__mvpPgBoss) return g.__mvpPgBoss as PgBoss;
-  const connectionString = process.env["DATABASE_URL"];
-  if (!connectionString) throw new Error("DATABASE_URL not set");
-  const boss = new PgBoss({ connectionString, schema: "pgboss" });
+  // pg-boss は LISTEN/NOTIFY と prepared statement を使うため Session mode 必須
+  // Prisma 用 (Transaction mode) と分けて専用 URL を持たせる
+  const connectionString =
+    process.env["PGBOSS_DATABASE_URL"] ?? process.env["DATABASE_URL"];
+  if (!connectionString) throw new Error("PGBOSS_DATABASE_URL / DATABASE_URL not set");
+  const boss = new PgBoss({
+    connectionString,
+    schema: "pgboss",
+    // Vercel serverless の同時インスタンス数を考慮し、最小プールに固定
+    max: 1,
+  });
   await boss.start();
   await boss.createQueue(QUEUE_DELIVERY);
   g.__mvpPgBoss = boss;

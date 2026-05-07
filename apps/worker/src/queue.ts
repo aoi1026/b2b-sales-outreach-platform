@@ -13,6 +13,11 @@ export async function getBoss(): Promise<PgBoss> {
     schema: "pgboss",
     retryLimit: 2,
     retryDelay: 30,
+    // Supabase Free tier の session pool (15) を圧迫しないため最小化
+    max: 2,
+    // pg-boss のメンテナンス系を控えめに (接続消費を抑える)
+    monitorStateIntervalSeconds: 60,
+    maintenanceIntervalSeconds: 120,
   });
   await bossInstance.start();
   await bossInstance.createQueue(QUEUE_DELIVERY);
