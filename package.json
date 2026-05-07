@@ -19,7 +19,8 @@
     "db:seed": "npm run seed --workspace=@mvp/db",
     "start:admin": "npm run start --workspace=@mvp/admin",
     "start:lp": "npm run start --workspace=@mvp/lp",
-    "start": "concurrently -n admin,lp -c blue,green \"npm:start:admin\" \"npm:start:lp\""
+    "start:worker": "npm run start --workspace=@mvp/worker",
+    "start": "concurrently -n admin,lp,worker -c blue,green,magenta \"npm:start:admin\" \"npm:start:lp\" \"npm:start:worker\""
   },
   "devDependencies": {
     "concurrently": "^9.2.1"
