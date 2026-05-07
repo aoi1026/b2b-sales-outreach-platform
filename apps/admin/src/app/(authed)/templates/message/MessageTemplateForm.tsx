@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useTransition } from "react";
+import { useRef, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import {
@@ -30,6 +30,7 @@ export default function MessageTemplateForm({ mode, charPresets, defaults }: Pro
   const [preset, setPreset] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isSaving, startSave] = useTransition();
+  const bodyRef = useRef<HTMLTextAreaElement>(null);
 
   const len = body.length;
   const over = preset !== null && len > preset;
@@ -52,7 +53,19 @@ export default function MessageTemplateForm({ mode, charPresets, defaults }: Pro
 
   const insertVar = (v: string) => {
     const token = `{{${v}}}`;
-    setBody((b) => (preset !== null && b.length + token.length > preset ? b : b + token));
+    const ta = bodyRef.current;
+    const start = ta?.selectionStart ?? body.length;
+    const end = ta?.selectionEnd ?? body.length;
+    const next = body.slice(0, start) + token + body.slice(end);
+    if (preset !== null && next.length > preset) return;
+    setBody(next);
+    requestAnimationFrame(() => {
+      const el = bodyRef.current;
+      if (!el) return;
+      const pos = start + token.length;
+      el.focus();
+      el.setSelectionRange(pos, pos);
+    });
   };
 
   return (
@@ -104,6 +117,7 @@ export default function MessageTemplateForm({ mode, charPresets, defaults }: Pro
             </div>
           </div>
           <textarea
+            ref={bodyRef}
             value={body}
             onChange={(e) => setBody(e.target.value)}
             rows={14}
