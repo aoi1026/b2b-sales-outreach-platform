@@ -1,0 +1,12 @@
+**/node_modules
+**/.next
+**/dist
+**/build
+**/.turbo
+.git
+.env
+.env.*
+*.log
+.DS_Store
+**/tsconfig.tsbuildinfo
+dashboard images

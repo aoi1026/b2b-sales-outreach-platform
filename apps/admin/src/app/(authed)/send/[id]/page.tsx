@@ -9,6 +9,7 @@ import {
   RESULT_STATUS_LABEL,
 } from "@/lib/delivery-status";
 import { pauseJobAction, resumeJobAction, cancelJobAction } from "../actions";
+import DeleteJobButton from "../DeleteJobButton";
 import AutoRefresh from "./AutoRefresh";
 import { fmtJstDateTime, fmtJstTime } from "@/lib/date-jst";
 
@@ -42,6 +43,7 @@ export default async function SendJobDetailPage({
   const canPause = job.status === "RUNNING" && !job.pauseRequested;
   const canResume = job.status === "PAUSED";
   const canCancel = isActive || job.status === "PAUSED";
+  const canDelete = job.status !== "RUNNING";
 
   const pause = pauseJobAction.bind(null, id);
   const resume = resumeJobAction.bind(null, id);
@@ -90,6 +92,13 @@ export default async function SendJobDetailPage({
                 キャンセル
               </button>
             </form>
+          )}
+          {canDelete && (
+            <DeleteJobButton
+              jobId={id}
+              redirectTo="/send"
+              className="px-3 py-1.5 border border-red-400 text-red-700 rounded hover:bg-red-50 text-sm"
+            />
           )}
         </div>
       </div>

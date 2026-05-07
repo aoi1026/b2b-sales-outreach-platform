@@ -89,3 +89,29 @@ export async function cancelJobAction(jobId: string): Promise<void> {
   });
   revalidatePath(`/send/${jobId}`);
 }
+
+export async function deleteJobAction(
+  jobId: string,
+): Promise<{ error?: string } | void> {
+  const user = await requireUser();
+  if (!user) return;
+
+  const job = await prisma.deliveryJob.findUnique({
+    where: { id: jobId },
+    select: { status: true },
+  });
+  if (!job) {
+    revalidatePath("/send");
+    return;
+  }
+  if (job.status === "RUNNING") {
+    return {
+      error:
+        "実行中のジョブは削除できません。先に「一時停止」または「キャンセル」を行ってください。",
+    };
+  }
+
+  // DeliveryResult は onDelete: Cascade なので job 削除で連鎖削除される
+  await prisma.deliveryJob.delete({ where: { id: jobId } });
+  revalidatePath("/send");
+}

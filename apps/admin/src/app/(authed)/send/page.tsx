@@ -3,6 +3,7 @@ import Breadcrumbs from "@/components/Breadcrumbs";
 import { prisma } from "@/lib/db";
 import { JOB_STATUS_BADGE, JOB_STATUS_LABEL } from "@/lib/delivery-status";
 import { fmtJstDate } from "@/lib/date-jst";
+import DeleteJobButton from "./DeleteJobButton";
 
 export const dynamic = "force-dynamic";
 
@@ -41,12 +42,13 @@ export default async function SendJobsPage() {
               <th className="text-left px-4 py-2 font-medium">ステータス</th>
               <th className="text-left px-4 py-2 font-medium">進捗</th>
               <th className="text-left px-4 py-2 font-medium w-28">作成日</th>
+              <th className="text-left px-4 py-2 font-medium w-20">操作</th>
             </tr>
           </thead>
           <tbody>
             {jobs.length === 0 && (
               <tr>
-                <td colSpan={7} className="px-4 py-10 text-center text-gray-500">
+                <td colSpan={8} className="px-4 py-10 text-center text-gray-500">
                   ジョブがまだありません。右上の「＋ 新規ジョブ」から作成してください。
                 </td>
               </tr>
@@ -76,6 +78,9 @@ export default async function SendJobsPage() {
                   </td>
                   <td className="px-4 py-3 text-gray-500 whitespace-nowrap">
                     {fmtJstDate(j.createdAt)}
+                  </td>
+                  <td className="px-4 py-3">
+                    <DeleteJobButton jobId={j.id} />
                   </td>
                 </tr>
               );
