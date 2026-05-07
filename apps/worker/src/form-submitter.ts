@@ -17,11 +17,28 @@ export async function closeBrowser(): Promise<void> {
   }
 }
 
-type FieldType = "company" | "person" | "email" | "phone" | "subject" | "message";
+type FieldRole =
+  | "email"
+  | "phone"
+  | "subject"
+  | "message"
+  | "position"
+  | "company"
+  | "company_kana"
+  | "person"
+  | "person_kana"
+  | "person_last"
+  | "person_first"
+  | null;
 
 const NAV_TIMEOUT = 30_000;
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 MVPBusinessMessage/0.1";
+
+// required を満たすためのフォールバック日本語
+const REQUIRED_FALLBACK_TEXT = "問い合わせ";
+
+// ============= Form picker =============
 
 async function scoreForm(form: ElementHandle<Element>): Promise<number> {
   const inputCount = await form.$$eval(
@@ -50,14 +67,15 @@ async function pickBestForm(
   return bestScore >= 2 ? best : null;
 }
 
-async function detectFieldType(
-  page: Page,
-  el: ElementHandle<Element>,
-): Promise<FieldType | null> {
+// ============= Element metadata =============
+
+async function getElementMeta(page: Page, el: ElementHandle<Element>) {
   const name = (await el.getAttribute("name")) ?? "";
   const id = (await el.getAttribute("id")) ?? "";
   const placeholder = (await el.getAttribute("placeholder")) ?? "";
-  const type = (await el.getAttribute("type")) ?? "";
+  const type = ((await el.getAttribute("type")) ?? "").toLowerCase();
+  const required = (await el.getAttribute("required")) !== null;
+  const tagName = (await el.evaluate((n) => n.tagName.toLowerCase())) as string;
 
   let labelText = "";
   if (id) {
@@ -73,15 +91,77 @@ async function detectFieldType(
     });
   }
 
-  const combined = [name, id, placeholder, labelText, type]
-    .join("|")
-    .toLowerCase();
+  return {
+    name,
+    id,
+    placeholder,
+    type,
+    required,
+    tagName,
+    labelText,
+    idLower: id.toLowerCase(),
+    nameLower: name.toLowerCase(),
+    combined: [name, id, placeholder, labelText, type].join("|").toLowerCase(),
+  };
+}
 
-  if (type === "email" || /メール|mail|e-?mail/.test(combined)) return "email";
-  if (type === "tel" || /電話|phone|tel/.test(combined)) return "phone";
+type ElementMeta = Awaited<ReturnType<typeof getElementMeta>>;
+
+// ============= Field role detection =============
+
+function detectFieldRole(meta: ElementMeta): FieldRole {
+  const { tagName, type, idLower, nameLower, combined } = meta;
+  const idOrName = `${idLower}|${nameLower}`;
+
+  // <textarea> 要素は常に本文
+  if (tagName === "textarea") return "message";
+
+  // type 属性によるハードな決定 (最優先)
+  if (type === "email") return "email";
+  if (type === "tel") return "phone";
+
+  // ====== id/name の specific patterns (ユーザ要件) ======
+
+  // フリガナ (会社用と氏名用を区別)
+  if (/(?:furi)?gana|kana|フリガナ|フリ|カナ/.test(idOrName)) {
+    if (/comp|coop|kaisha|company/.test(idOrName)) return "company_kana";
+    return "person_kana";
+  }
+
+  // 会社名: coop_name / company_name / company
+  if (/coop_name|company_name|^company$|_company$|company_/.test(idOrName))
+    return "company";
+
+  // 担当者氏名 (cp_name)
+  if (/cp_name/.test(idOrName)) return "person";
+
+  // 姓・名 (last_name/first_name とその variants)
+  if (/(?:^|_|-)last[_\-]?name|lastname|sei|family[_\-]?name/.test(idOrName))
+    return "person_last";
+  if (/(?:^|_|-)first[_\-]?name|firstname|^mei$|_mei|given[_\-]?name/.test(idOrName))
+    return "person_first";
+
+  // メール
+  if (/email|e[_\-]?mail|^mail$|_mail/.test(idOrName)) return "email";
+
+  // 電話
+  if (/^tel$|_tel|phone|denwa/.test(idOrName)) return "phone";
+
+  // 役職 (常に "担当者" 固定)
+  if (/^position$|_position|position_|yakushoku|役職/.test(idOrName))
+    return "position";
+
+  // 件名
+  if (/^subject$|_subject|title|kenmei|件名/.test(idOrName)) return "subject";
+
+  // ====== ここまでで決まらなければ <label>/placeholder 等のヒューリスティック ======
+  if (/メール|mail|e-?mail/.test(combined)) return "email";
+  if (/電話|phone|tel/.test(combined)) return "phone";
+  if (/件名|タイトル|subject|title/.test(combined)) return "subject";
   if (/会社|法人|団体|company|organization|organisation/.test(combined))
     return "company";
-  if (/件名|タイトル|subject|title/.test(combined)) return "subject";
+  if (/フリガナ|ふりがな|カナ|kana/.test(combined)) return "person_kana";
+  if (/役職|position/.test(combined)) return "position";
   if (/問い?合わ?せ|内容|message|comment|inquiry|body|質問|相談/.test(combined))
     return "message";
   if (/氏名|お名前|担当者|氏|name/.test(combined)) return "person";
@@ -89,36 +169,195 @@ async function detectFieldType(
   return null;
 }
 
-async function fillForm(
+// ============= Value selection =============
+
+function pickValueForRole(role: FieldRole, input: FormInput): string | null {
+  if (!role) return null;
+  switch (role) {
+    case "email":
+      return input.email ?? null;
+    case "phone":
+      return input.phone ?? null;
+    case "subject":
+      return input.subject ?? null;
+    case "message":
+      return input.message ?? null;
+    case "position":
+      return input.position ?? "担当者";
+    case "company":
+      return input.company ?? null;
+    case "company_kana":
+      // 専用 kana が無ければ会社名そのまま (バリデーションで弾かれる可能性あり)
+      return input.companyKana ?? input.company ?? null;
+    case "person":
+      return input.person ?? null;
+    case "person_kana":
+      return input.personKana ?? input.person ?? null;
+    case "person_last":
+      return input.personLast ?? input.person ?? null;
+    case "person_first":
+      return input.personFirst ?? null;
+    default:
+      return null;
+  }
+}
+
+async function safeFill(el: ElementHandle<Element>, value: string): Promise<boolean> {
+  try {
+    await el.fill(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ============= Text-like field filling (input + textarea) =============
+
+const SKIP_INPUT_TYPES = new Set([
+  "submit",
+  "button",
+  "hidden",
+  "checkbox",
+  "radio",
+  "file",
+  "image",
+  "reset",
+]);
+
+async function fillTextLikeFields(
   page: Page,
   form: ElementHandle<Element>,
   input: FormInput,
 ): Promise<number> {
   const elements = await form.$$("input, textarea");
   let filled = 0;
+
   for (const el of elements) {
-    const tagName = await el.evaluate((n) => n.tagName.toLowerCase());
-    if (tagName === "input") {
-      const t = (await el.getAttribute("type"))?.toLowerCase() ?? "text";
-      if (
-        ["submit", "button", "hidden", "checkbox", "radio", "file", "image", "reset"].includes(t)
-      ) {
-        continue;
-      }
+    const meta = await getElementMeta(page, el);
+
+    // <input> でテキスト系以外 (submit/checkbox/radio など) はここでは触らない
+    if (meta.tagName === "input" && SKIP_INPUT_TYPES.has(meta.type)) continue;
+
+    const role = detectFieldRole(meta);
+    let value = pickValueForRole(role, input);
+
+    // role が決まらない & required 属性 → required を満たすデフォルトで埋める
+    if ((!value || value === "") && meta.required) {
+      value =
+        meta.tagName === "textarea"
+          ? input.message ?? REQUIRED_FALLBACK_TEXT
+          : REQUIRED_FALLBACK_TEXT;
     }
-    const fieldType = await detectFieldType(page, el);
-    if (!fieldType) continue;
-    const value = input[fieldType];
+
     if (value === undefined || value === null || value === "") continue;
-    try {
-      await el.fill(value);
-      filled++;
-    } catch {
-      /* ignore individual field fill errors */
-    }
+
+    const ok = await safeFill(el, value);
+    if (ok) filled++;
   }
+
   return filled;
 }
+
+// ============= Checkbox handling =============
+
+async function processCheckboxes(form: ElementHandle<Element>): Promise<void> {
+  const checkboxes = await form.$$('input[type="checkbox"]');
+  if (checkboxes.length === 0) return;
+
+  // (1) id/name に "agree" 等 を含むものは無条件にチェック
+  // (2) それ以外は name 属性でグループ化し、各グループの先頭をチェック
+  const groupByName = new Map<string, ElementHandle<Element>[]>();
+
+  for (const cb of checkboxes) {
+    const id = ((await cb.getAttribute("id")) ?? "").toLowerCase();
+    const name = ((await cb.getAttribute("name")) ?? "").toLowerCase();
+    const isAgree = /agree|同意|承諾|consent|terms|privacy/.test(`${id}|${name}`);
+
+    if (isAgree) {
+      try {
+        await cb.check({ force: true });
+      } catch {
+        /* ignore */
+      }
+      continue;
+    }
+
+    const key = name || `__${groupByName.size}`;
+    const list = groupByName.get(key) ?? [];
+    list.push(cb);
+    groupByName.set(key, list);
+  }
+
+  // 並んでいる checkbox 群 (= 同じ name) の先頭を選択
+  for (const list of groupByName.values()) {
+    if (list.length === 0) continue;
+    if (list.length >= 2) {
+      try {
+        await list[0]!.check({ force: true });
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
+// ============= Radio handling =============
+
+async function processRadios(form: ElementHandle<Element>): Promise<void> {
+  const radios = await form.$$('input[type="radio"]');
+  if (radios.length === 0) return;
+
+  // name 属性でグループ化し、各グループの先頭を選択
+  const groupByName = new Map<string, ElementHandle<Element>[]>();
+  for (const r of radios) {
+    const name = ((await r.getAttribute("name")) ?? "").toLowerCase();
+    const key = name || `__${groupByName.size}`;
+    const list = groupByName.get(key) ?? [];
+    list.push(r);
+    groupByName.set(key, list);
+  }
+
+  for (const list of groupByName.values()) {
+    if (list.length === 0) continue;
+    try {
+      await list[0]!.check({ force: true });
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+// ============= Submit button =============
+
+async function findSubmitButton(
+  form: ElementHandle<Element>,
+): Promise<ElementHandle<Element> | null> {
+  // 1. type="submit" の input/button
+  const typed = await form.$('input[type="submit"], button[type="submit"]');
+  if (typed) return typed;
+
+  // 2. name="send" の要素
+  const namedSend = await form.$('[name="send"]');
+  if (namedSend) return namedSend;
+
+  // 3. name に send/submit/confirm を含む button/input
+  const sendLike = await form.$(
+    'button[name*="send"], button[name*="submit"], button[name*="confirm"], input[name*="send"], input[name*="submit"], input[name*="confirm"]',
+  );
+  if (sendLike) return sendLike;
+
+  // 4. テキストに 送信/確認/submit/send を含む button
+  const buttons = await form.$$("button");
+  for (const b of buttons) {
+    const text = ((await b.textContent()) ?? "").toLowerCase().trim();
+    if (/送信|確認|submit|send|確定/.test(text)) return b;
+  }
+
+  // 5. フォールバック: 最初の button
+  return (await form.$("button")) ?? null;
+}
+
+// ============= Success / error detection =============
 
 const SUCCESS_PATTERNS = [
   /送信完了/,
@@ -141,13 +380,13 @@ const ERROR_PATTERNS = [
 ];
 
 function isSuccessContent(content: string): boolean {
-  if (SUCCESS_PATTERNS.some((p) => p.test(content))) return true;
-  return false;
+  return SUCCESS_PATTERNS.some((p) => p.test(content));
 }
-
 function isErrorContent(content: string): boolean {
   return ERROR_PATTERNS.some((p) => p.test(content));
 }
+
+// ============= Main =============
 
 export async function submitForm(
   formUrl: string,
@@ -181,7 +420,7 @@ export async function submitForm(
       };
     }
 
-    const filled = await fillForm(page, form, input);
+    const filled = await fillTextLikeFields(page, form, input);
     if (filled === 0) {
       return {
         status: "failed",
@@ -191,10 +430,10 @@ export async function submitForm(
       };
     }
 
-    const submitBtn =
-      (await form.$('button[type="submit"], input[type="submit"]')) ??
-      (await form.$("button")) ??
-      null;
+    await processCheckboxes(form);
+    await processRadios(form);
+
+    const submitBtn = await findSubmitButton(form);
     if (!submitBtn) {
       return {
         status: "failed",

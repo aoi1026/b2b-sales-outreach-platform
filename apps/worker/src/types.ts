@@ -1,10 +1,15 @@
 export type FormInput = {
   company?: string | null;
+  companyKana?: string | null;
   person?: string | null;
+  personKana?: string | null;
+  personFirst?: string | null;
+  personLast?: string | null;
   email?: string | null;
   phone?: string | null;
   subject?: string | null;
   message?: string | null;
+  position?: string | null;
 };
 
 export type SubmitResult = {

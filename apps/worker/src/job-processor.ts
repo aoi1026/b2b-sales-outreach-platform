@@ -14,6 +14,20 @@ function applyVars(text: string, companyName: string): string {
     .replace(/\{\{\s*担当者名\s*\}\}/g, "ご担当者");
 }
 
+// 「山田 太郎」→ { last: "山田", first: "太郎" }
+// 半角/全角スペースで分割。スペース無しは全体を last_name 扱い
+function splitJapaneseName(fullName: string | null | undefined): {
+  last: string | null;
+  first: string | null;
+} {
+  if (!fullName) return { last: null, first: null };
+  const parts = fullName.split(/[\s　]+/).filter(Boolean);
+  if (parts.length >= 2) {
+    return { last: parts[0]!, first: parts.slice(1).join(" ") };
+  }
+  return { last: fullName, first: null };
+}
+
 async function ensureJobResultRows(jobId: string): Promise<void> {
   const job = await prisma.deliveryJob.findUnique({
     where: { id: jobId },
@@ -134,13 +148,23 @@ export async function processDeliveryJob(
       continue;
     }
 
+    const personName = job.senderTemplate?.personName ?? null;
+    const { last: personLast, first: personFirst } = splitJapaneseName(personName);
+
     const input: FormInput = {
       company: job.senderTemplate?.companyName ?? null,
-      person: job.senderTemplate?.personName ?? null,
+      // SenderTemplate に kana 専用フィールドがないので、現状は会社名/氏名そのままを
+      // フォールバックとして送る (form-submitter 側でも同様のフォールバックあり)
+      companyKana: null,
+      person: personName,
+      personKana: null,
+      personLast,
+      personFirst,
       email: job.senderTemplate?.email ?? null,
       phone: job.senderTemplate?.phone ?? null,
       subject: applyVars(job.messageTemplate.subject, company.name),
       message: applyVars(job.messageTemplate.body, company.name),
+      position: "担当者",
     };
 
     await prisma.deliveryResult.update({
