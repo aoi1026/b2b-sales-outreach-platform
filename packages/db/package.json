@@ -7,11 +7,11 @@
   "scripts": {
     "postinstall": "prisma generate",
     "generate": "prisma generate",
-    "migrate": "prisma migrate dev",
-    "migrate:deploy": "prisma migrate deploy",
-    "studio": "prisma studio",
-    "db:push": "prisma db push",
-    "seed": "tsx scripts/seed.ts"
+    "migrate": "dotenv -e ../../.env -- prisma migrate dev",
+    "migrate:deploy": "dotenv -e ../../.env -- prisma migrate deploy",
+    "studio": "dotenv -e ../../.env -- prisma studio",
+    "db:push": "dotenv -e ../../.env -- prisma db push",
+    "seed": "dotenv -e ../../.env -- tsx scripts/seed.ts"
   },
   "dependencies": {
     "@prisma/client": "^6.1.0",
