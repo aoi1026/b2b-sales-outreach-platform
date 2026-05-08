@@ -155,15 +155,19 @@ export async function processDeliveryJob(
 
     const input: FormInput = {
       company: job.senderTemplate?.companyName ?? null,
-      // SenderTemplate に kana 専用フィールドがないので、現状は会社名/氏名そのままを
-      // フォールバックとして送る (form-submitter 側でも同様のフォールバックあり)
+      // 会社のカナは現状 SenderTemplate に欄がないため null。form-submitter 側では
+      // 不在時は漢字社名にフォールバックする。
       companyKana: null,
       person: personName,
-      personKana: null,
+      personHiragana: job.senderTemplate?.personHiragana ?? null,
+      personKatakana: job.senderTemplate?.personKatakana ?? null,
+      // personKana は後方互換用。明示的にカタカナがあればそれ、無ければ漢字。
+      personKana: job.senderTemplate?.personKatakana ?? null,
       personLast,
       personFirst,
       email: job.senderTemplate?.email ?? null,
       phone: job.senderTemplate?.phone ?? null,
+      postalCode: job.senderTemplate?.postalCode ?? null,
       subject: applyVars(job.messageTemplate.subject, company.name),
       message: applyVars(job.messageTemplate.body, company.name),
       position: "担当者",

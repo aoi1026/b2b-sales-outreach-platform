@@ -6,6 +6,8 @@ type Defaults = {
   name: string;
   companyName: string;
   personName: string;
+  personHiragana: string | null;
+  personKatakana: string | null;
   email: string;
   phone: string | null;
   postalCode: string | null;
@@ -31,6 +33,8 @@ export default function SenderTemplateForm({
         <Field label="テンプレート名" name="name" required defaultValue={defaults?.name} maxLength={120} />
         <Field label="会社名" name="companyName" required defaultValue={defaults?.companyName} maxLength={200} />
         <Field label="担当者氏名" name="personName" required defaultValue={defaults?.personName} maxLength={120} />
+        <Field label="担当者氏名 (ひらがな)" name="personHiragana" defaultValue={defaults?.personHiragana ?? ""} maxLength={120} placeholder="やまだ たろう" />
+        <Field label="担当者氏名 (カタカナ)" name="personKatakana" defaultValue={defaults?.personKatakana ?? ""} maxLength={120} placeholder="ヤマダ タロウ" />
         <Field label="メールアドレス" name="email" type="email" required defaultValue={defaults?.email} maxLength={200} />
         <Field label="電話番号" name="phone" defaultValue={defaults?.phone ?? ""} maxLength={40} />
         <Field label="郵便番号" name="postalCode" defaultValue={defaults?.postalCode ?? ""} maxLength={20} />

@@ -27,6 +27,7 @@ type FieldRole =
   | "company_kana"
   | "person"
   | "person_kana"
+  | "person_hiragana"
   | "person_last"
   | "person_first"
   | null;
@@ -122,8 +123,13 @@ function detectFieldRole(meta: ElementMeta): FieldRole {
 
   // ====== id/name の specific patterns (ユーザ要件) ======
 
-  // フリガナ (会社用と氏名用を区別)
-  if (/(?:furi)?gana|kana|フリガナ|フリ|カナ/.test(idOrName)) {
+  // ひらがな (id/name に hira/hiragana/ひらがな)
+  if (/hira(?:gana)?|ひらがな/.test(idOrName)) {
+    return "person_hiragana";
+  }
+
+  // カタカナ・フリガナ (会社用と氏名用を区別)
+  if (/katakana|(?:furi)?gana|^kana$|_kana|kana_|フリガナ|フリ|カナ|カタカナ/.test(idOrName)) {
     if (/comp|coop|kaisha|company/.test(idOrName)) return "company_kana";
     return "person_kana";
   }
@@ -192,7 +198,10 @@ function pickValueForRole(role: FieldRole, input: FormInput): string | null {
     case "person":
       return input.person ?? null;
     case "person_kana":
-      return input.personKana ?? input.person ?? null;
+      // 専用カタカナがあればそれ、無ければ汎用 personKana、最後に漢字氏名
+      return input.personKatakana ?? input.personKana ?? input.person ?? null;
+    case "person_hiragana":
+      return input.personHiragana ?? input.person ?? null;
     case "person_last":
       return input.personLast ?? input.person ?? null;
     case "person_first":
@@ -208,6 +217,103 @@ async function safeFill(el: ElementHandle<Element>, value: string): Promise<bool
     return true;
   } catch {
     return false;
+  }
+}
+
+// ============= Phone / Postal split =============
+
+// 電話を [前,中,後] に分割。ハイフン区切り 3 分割があればそれを優先、無ければ
+// 数字のみ抽出して 2-4-4 で切る (ユーザ要件)。
+function splitPhoneNumber(phone: string): [string, string, string] {
+  const hyphenated = phone.split(/[-ー‐−–—]/).map((s) => s.trim()).filter(Boolean);
+  if (hyphenated.length === 3) {
+    return [hyphenated[0]!, hyphenated[1]!, hyphenated[2]!];
+  }
+  const digits = phone.replace(/\D/g, "");
+  return [digits.slice(0, 2), digits.slice(2, 6), digits.slice(6, 10)];
+}
+
+// 郵便番号を [前,後] に分割。ハイフン区切り 2 分割があればそれを優先、無ければ 3-4。
+function splitPostalCode(postal: string): [string, string] {
+  const hyphenated = postal.split(/[-ー‐−–—]/).map((s) => s.trim()).filter(Boolean);
+  if (hyphenated.length === 2) {
+    return [hyphenated[0]!, hyphenated[1]!];
+  }
+  const digits = postal.replace(/\D/g, "");
+  return [digits.slice(0, 3), digits.slice(3, 7)];
+}
+
+// フォーム内の name に "tel" を含む input 要素 (テキスト系のみ) を順序通り取得
+async function findGroupedInputs(
+  form: ElementHandle<Element>,
+  pattern: RegExp,
+): Promise<ElementHandle<Element>[]> {
+  const all = await form.$$("input");
+  const matched: ElementHandle<Element>[] = [];
+  for (const el of all) {
+    const type = ((await el.getAttribute("type")) ?? "text").toLowerCase();
+    if (SKIP_INPUT_TYPES.has(type)) continue;
+    const name = ((await el.getAttribute("name")) ?? "").toLowerCase();
+    if (pattern.test(name)) matched.push(el);
+  }
+  return matched;
+}
+
+// 戻り値: 充填済みの name 属性集合 (後段の通常フィルで再度埋めないために使う)
+async function fillSplitGroups(
+  form: ElementHandle<Element>,
+  input: FormInput,
+): Promise<Set<string>> {
+  const consumedNames = new Set<string>();
+
+  const remember = async (el: ElementHandle<Element>) => {
+    const name = (await el.getAttribute("name")) ?? "";
+    if (name) consumedNames.add(name);
+  };
+
+  // tel × 3 → 2-4-4 で分割充填
+  const telInputs = await findGroupedInputs(form, /tel/);
+  if (telInputs.length === 3 && input.phone) {
+    const [a, b, c] = splitPhoneNumber(input.phone);
+    if (a) await safeFill(telInputs[0]!, a);
+    if (b) await safeFill(telInputs[1]!, b);
+    if (c) await safeFill(telInputs[2]!, c);
+    for (const el of telInputs) await remember(el);
+  }
+
+  // zip / postal × 2 → 3-4 で分割充填
+  const zipInputs = await findGroupedInputs(form, /zip|postal|yubin|郵便/);
+  if (zipInputs.length === 2 && input.postalCode) {
+    const [a, b] = splitPostalCode(input.postalCode);
+    if (a) await safeFill(zipInputs[0]!, a);
+    if (b) await safeFill(zipInputs[1]!, b);
+    for (const el of zipInputs) await remember(el);
+  }
+
+  return consumedNames;
+}
+
+// ============= Select handling =============
+
+// <select> 要素は2番目以降の <option> を選択 (1番目はプレースホルダー想定)
+async function processSelects(form: ElementHandle<Element>): Promise<void> {
+  const selects = await form.$$("select");
+  for (const sel of selects) {
+    try {
+      const optionValues = await sel.$$eval("option", (opts) =>
+        (opts as HTMLOptionElement[]).map((o) => o.value),
+      );
+      // 2番目以降のうち、空でない最初の値を選ぶ
+      const target = optionValues.slice(1).find((v) => v && v.trim() !== "");
+      if (target !== undefined) {
+        await sel.selectOption(target);
+      } else if (optionValues.length >= 1 && optionValues[0]) {
+        // 全て空なら最初の値
+        await sel.selectOption(optionValues[0]);
+      }
+    } catch {
+      /* ignore */
+    }
   }
 }
 
@@ -228,6 +334,7 @@ async function fillTextLikeFields(
   page: Page,
   form: ElementHandle<Element>,
   input: FormInput,
+  consumedNames: Set<string>,
 ): Promise<number> {
   const elements = await form.$$("input, textarea");
   let filled = 0;
@@ -237,6 +344,9 @@ async function fillTextLikeFields(
 
     // <input> でテキスト系以外 (submit/checkbox/radio など) はここでは触らない
     if (meta.tagName === "input" && SKIP_INPUT_TYPES.has(meta.type)) continue;
+
+    // 既に分割グループ (tel×3 / zip×2) で埋め済みの name はスキップ
+    if (meta.name && consumedNames.has(meta.name)) continue;
 
     const role = detectFieldRole(meta);
     let value = pickValueForRole(role, input);
@@ -382,6 +492,24 @@ async function findConfirmationSendButton(
   return null;
 }
 
+// 最終確認ボタン: id または name が "submit" の要素のうち、
+// value/表示テキストに "Send Message" または "送信" を含むものを選ぶ。
+async function findFinalSubmitButton(
+  page: Page,
+): Promise<ElementHandle<Element> | null> {
+  const candidates = await page.$$('[id="submit"], [name="submit"]');
+  if (candidates.length === 0) return null;
+
+  for (const el of candidates) {
+    const value = (await el.getAttribute("value")) ?? "";
+    const text = ((await el.textContent()) ?? "").trim();
+    if (/Send\s*Message|送信/i.test(value) || /Send\s*Message|送信/i.test(text)) {
+      return el;
+    }
+  }
+  return null;
+}
+
 // ============= Success / error detection =============
 
 const SUCCESS_PATTERNS = [
@@ -445,8 +573,12 @@ export async function submitForm(
       };
     }
 
-    const filled = await fillTextLikeFields(page, form, input);
-    if (filled === 0) {
+    // 1) tel × 3 / zip × 2 のような分割入力欄を先に埋める (ユーザ要件)
+    const consumedNames = await fillSplitGroups(form, input);
+
+    // 2) 通常のテキスト/textarea/email/tel フィールドを埋める
+    const filled = await fillTextLikeFields(page, form, input, consumedNames);
+    if (filled === 0 && consumedNames.size === 0) {
       return {
         status: "failed",
         errorType: "FIELD_MISMATCH",
@@ -455,6 +587,8 @@ export async function submitForm(
       };
     }
 
+    // 3) <select>, checkbox, radio を処理
+    await processSelects(form);
     await processCheckboxes(form);
     await processRadios(form);
 
@@ -485,6 +619,18 @@ export async function submitForm(
           .waitForLoadState("networkidle", { timeout: NAV_TIMEOUT })
           .catch(() => null),
         confirmBtn.click({ timeout: NAV_TIMEOUT }),
+      ]);
+    }
+
+    // 更に id/name="submit" を持ち value/text に "Send Message"/"送信" を含む要素があれば
+    // 最終確認としてもう一度クリック (3段階目)
+    const finalBtn = await findFinalSubmitButton(page);
+    if (finalBtn) {
+      await Promise.all([
+        page
+          .waitForLoadState("networkidle", { timeout: NAV_TIMEOUT })
+          .catch(() => null),
+        finalBtn.click({ timeout: NAV_TIMEOUT }),
       ]);
     }
 

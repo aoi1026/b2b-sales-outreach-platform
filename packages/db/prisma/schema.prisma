@@ -140,17 +140,19 @@ model MessageTemplate {
 }
 
 model SenderTemplate {
-  id          String   @id @default(cuid())
-  name        String
-  companyName String   @map("company_name")
-  personName  String   @map("person_name")
-  email       String
-  phone       String?
-  postalCode  String?  @map("postal_code")
-  address     String?
-  url         String?
-  createdAt   DateTime @default(now()) @map("created_at")
-  updatedAt   DateTime @updatedAt @map("updated_at")
+  id             String   @id @default(cuid())
+  name           String
+  companyName    String   @map("company_name")
+  personName     String   @map("person_name")
+  personHiragana String?  @map("person_hiragana")
+  personKatakana String?  @map("person_katakana")
+  email          String
+  phone          String?
+  postalCode     String?  @map("postal_code")
+  address        String?
+  url            String?
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
 
   caseTemplates CaseTemplate[]
   deliveryJobs  DeliveryJob[]

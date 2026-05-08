@@ -3,10 +3,13 @@ export type FormInput = {
   companyKana?: string | null;
   person?: string | null;
   personKana?: string | null;
+  personHiragana?: string | null;
+  personKatakana?: string | null;
   personFirst?: string | null;
   personLast?: string | null;
   email?: string | null;
   phone?: string | null;
+  postalCode?: string | null;
   subject?: string | null;
   message?: string | null;
   position?: string | null;
