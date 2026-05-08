@@ -357,6 +357,31 @@ async function findSubmitButton(
   return (await form.$("button")) ?? null;
 }
 
+// 確認画面用: type="submit" / name="send" の要素のうち、value (または <button> のテキスト) に
+// 「送信」を含むもののみを選ぶ。「戻る」ボタンを誤って押さないため value 判定は必須。
+async function findConfirmationSendButton(
+  page: Page,
+): Promise<ElementHandle<Element> | null> {
+  const candidates = await page.$$(
+    'input[type="submit"], button[type="submit"], [name="send"]',
+  );
+  if (candidates.length === 0) return null;
+
+  for (const el of candidates) {
+    // <input type="submit"> は value 属性に表示文字が入る
+    const value = (await el.getAttribute("value")) ?? "";
+    if (/送信/.test(value)) return el;
+
+    // <button>送信する</button> 形式は value 属性が無いのでテキストを見る
+    const tag = await el.evaluate((n) => n.tagName.toLowerCase());
+    if (tag === "button") {
+      const text = ((await el.textContent()) ?? "").trim();
+      if (/送信/.test(text)) return el;
+    }
+  }
+  return null;
+}
+
 // ============= Success / error detection =============
 
 const SUCCESS_PATTERNS = [
@@ -450,6 +475,18 @@ export async function submitForm(
         .catch(() => null),
       submitBtn.click({ timeout: NAV_TIMEOUT }),
     ]);
+
+    // 確認画面が出るタイプのフォーム対策:
+    // 次ページに「送信」value/text を持つ submit/name=send があれば、もう一度クリック
+    const confirmBtn = await findConfirmationSendButton(page);
+    if (confirmBtn) {
+      await Promise.all([
+        page
+          .waitForLoadState("networkidle", { timeout: NAV_TIMEOUT })
+          .catch(() => null),
+        confirmBtn.click({ timeout: NAV_TIMEOUT }),
+      ]);
+    }
 
     const urlAfter = page.url();
     const content = await page.content().catch(() => "");

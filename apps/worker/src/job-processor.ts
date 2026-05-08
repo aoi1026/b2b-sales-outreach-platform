@@ -7,6 +7,8 @@ const prisma = new PrismaClient();
 
 const INTER_COMPANY_DELAY_MS = 2000;
 const MAX_ATTEMPTS = 3;
+// 1社あたりの全リトライ含む最大処理時間。これを超えると TIMEOUT 扱いで次社へ。
+const PER_COMPANY_TIMEOUT_MS = 180_000;
 
 function applyVars(text: string, companyName: string): string {
   return text
@@ -172,22 +174,55 @@ export async function processDeliveryJob(
       data: { status: "RUNNING" },
     });
 
-    let attemptsUsed = 0;
-    let finalResult: Awaited<ReturnType<typeof submitForm>> | null = null;
-    for (let i = 0; i < MAX_ATTEMPTS; i++) {
-      attemptsUsed++;
-      try {
-        const res = await submitForm(company.formUrl, input);
-        finalResult = res;
-        if (res.status === "success") break;
-      } catch (e) {
-        finalResult = {
-          status: "failed",
-          errorType: "UNKNOWN",
-          errorMessage: (e as Error).message,
-        };
+    // 1社あたり最大 PER_COMPANY_TIMEOUT_MS (3分) のハードキャップ。
+    // リトライ全体を一つの Promise として race し、タイムアウトしたら TIMEOUT で次社へ。
+    type Outcome = {
+      attempts: number;
+      result: Awaited<ReturnType<typeof submitForm>>;
+    };
+
+    const attemptLoop = async (): Promise<Outcome> => {
+      let attempts = 0;
+      let last: Awaited<ReturnType<typeof submitForm>> = {
+        status: "failed",
+        errorType: "UNKNOWN",
+        errorMessage: "未実行",
+      };
+      for (let i = 0; i < MAX_ATTEMPTS; i++) {
+        attempts++;
+        try {
+          last = await submitForm(company.formUrl, input);
+          if (last.status === "success") break;
+        } catch (e) {
+          last = {
+            status: "failed",
+            errorType: "UNKNOWN",
+            errorMessage: (e as Error).message,
+          };
+        }
       }
-    }
+      return { attempts, result: last };
+    };
+
+    const timeoutPromise = new Promise<Outcome>((resolve) =>
+      setTimeout(
+        () =>
+          resolve({
+            attempts: 0,
+            result: {
+              status: "failed",
+              errorType: "TIMEOUT",
+              errorMessage: `1社あたりの最大処理時間 (${PER_COMPANY_TIMEOUT_MS / 1000}秒) を超過しました。`,
+            },
+          }),
+        PER_COMPANY_TIMEOUT_MS,
+      ),
+    );
+
+    const { attempts: attemptsUsed, result: finalResult } = await Promise.race([
+      attemptLoop(),
+      timeoutPromise,
+    ]);
 
     if (finalResult?.status === "success") {
       successCount++;
