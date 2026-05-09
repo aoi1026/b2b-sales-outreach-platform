@@ -5,7 +5,16 @@ let browserInstance: Browser | null = null;
 
 export async function getBrowser(): Promise<Browser> {
   if (!browserInstance) {
-    browserInstance = await chromium.launch({ headless: true });
+    // ローカルで挙動を目視確認したい場合は WORKER_HEADED=true で起動 (ブラウザ画面が開く)。
+    // 任意で WORKER_SLOWMO=300 のようにミリ秒指定すると操作の間に遅延が入って見やすい。
+    // 本番 (Railway 等の Linux コンテナ) は未設定なので headless: true で動く。
+    const headed = process.env["WORKER_HEADED"] === "true";
+    const slowMoEnv = process.env["WORKER_SLOWMO"];
+    const slowMo = slowMoEnv ? Number(slowMoEnv) : undefined;
+    browserInstance = await chromium.launch({
+      headless: !headed,
+      ...(slowMo && Number.isFinite(slowMo) ? { slowMo } : {}),
+    });
   }
   return browserInstance;
 }
@@ -20,6 +29,7 @@ export async function closeBrowser(): Promise<void> {
 type FieldRole =
   | "email"
   | "phone"
+  | "postal_code"
   | "subject"
   | "message"
   | "position"
@@ -153,6 +163,9 @@ function detectFieldRole(meta: ElementMeta): FieldRole {
   // 電話
   if (/^tel$|_tel|phone|denwa/.test(idOrName)) return "phone";
 
+  // 郵便番号 (分割欄で埋まっていない場合の単一 input 用フォールバック)
+  if (/zip|postal|yubin|郵便/.test(idOrName)) return "postal_code";
+
   // 役職 (常に "担当者" 固定)
   if (/^position$|_position|position_|yakushoku|役職/.test(idOrName))
     return "position";
@@ -184,6 +197,8 @@ function pickValueForRole(role: FieldRole, input: FormInput): string | null {
       return input.email ?? null;
     case "phone":
       return input.phone ?? null;
+    case "postal_code":
+      return input.postalCode ?? null;
     case "subject":
       return input.subject ?? null;
     case "message":
@@ -411,6 +426,143 @@ async function processCheckboxes(form: ElementHandle<Element>): Promise<void> {
   }
 }
 
+// ============= Required field final validation =============
+// Step 4〜7 の後に呼ばれ、required 属性付きで未充填の要素を検出して
+// 適切なデフォルトで埋める「最終セーフティネット」。
+
+function todayYmd(): string {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+async function ensureAllRequiredFilled(
+  page: Page,
+  form: ElementHandle<Element>,
+  input: FormInput,
+): Promise<void> {
+  const requiredEls = await form.$$("[required]");
+
+  for (const el of requiredEls) {
+    const tagName = (await el.evaluate((n) => n.tagName.toLowerCase())) as string;
+    const type = ((await el.getAttribute("type")) ?? "").toLowerCase();
+
+    try {
+      // ----- <select> -----
+      if (tagName === "select") {
+        const value = await el.evaluate((n) => (n as HTMLSelectElement).value);
+        if (!value || value.trim() === "") {
+          // processSelects と同じロジック (2番目以降の有効値)
+          const optionValues = await el.$$eval("option", (opts) =>
+            (opts as HTMLOptionElement[]).map((o) => o.value),
+          );
+          const target =
+            optionValues.slice(1).find((v) => v && v.trim() !== "") ??
+            optionValues[0];
+          if (target) {
+            // selectOption は ElementHandle が select でなければ失敗するので caller でラップ
+            await (el as ElementHandle<HTMLSelectElement>).selectOption(target);
+          }
+        }
+        continue;
+      }
+
+      // ----- input[type=checkbox] -----
+      if (tagName === "input" && type === "checkbox") {
+        const checked = await (el as ElementHandle<HTMLInputElement>).isChecked();
+        if (!checked) {
+          await (el as ElementHandle<HTMLInputElement>).check({ force: true });
+        }
+        continue;
+      }
+
+      // ----- input[type=radio] -----
+      if (tagName === "input" && type === "radio") {
+        const name = (await el.getAttribute("name")) ?? "";
+        if (name) {
+          // 同じ name グループのうち1つでも checked なら何もしない
+          const anyChecked = await form.$$eval(
+            `input[type="radio"][name="${name.replace(/"/g, '\\"')}"]`,
+            (radios) => (radios as HTMLInputElement[]).some((r) => r.checked),
+          );
+          if (!anyChecked) {
+            await (el as ElementHandle<HTMLInputElement>).check({ force: true });
+          }
+        } else {
+          await (el as ElementHandle<HTMLInputElement>).check({ force: true });
+        }
+        continue;
+      }
+
+      // ----- input[type=date] -----
+      if (tagName === "input" && type === "date") {
+        const value = await (el as ElementHandle<HTMLInputElement>).inputValue();
+        if (!value || value.trim() === "") {
+          await (el as ElementHandle<HTMLInputElement>).fill(todayYmd());
+        }
+        continue;
+      }
+
+      // ----- input[type=number] / time / datetime-local 等 -----
+      if (tagName === "input" && (type === "number" || type === "time" || type === "datetime-local")) {
+        const value = await (el as ElementHandle<HTMLInputElement>).inputValue();
+        if (!value || value.trim() === "") {
+          const fallback =
+            type === "number"
+              ? "1"
+              : type === "time"
+                ? "10:00"
+                : `${todayYmd()}T10:00`;
+          await (el as ElementHandle<HTMLInputElement>).fill(fallback);
+        }
+        continue;
+      }
+
+      // ----- text-like (input + textarea) -----
+      if (tagName === "textarea" || (tagName === "input" && !SKIP_INPUT_TYPES.has(type))) {
+        const value = await (el as ElementHandle<HTMLInputElement>).inputValue();
+        if (!value || value.trim() === "") {
+          // まずは正規の役割検出を試す (今まで未マッチだったが補えるかも)
+          const meta = await getElementMeta(page, el);
+          const role = detectFieldRole(meta);
+          let val = pickValueForRole(role, input);
+          if (!val) {
+            val = tagName === "textarea"
+              ? (input.message ?? REQUIRED_FALLBACK_TEXT)
+              : REQUIRED_FALLBACK_TEXT;
+          }
+          await safeFill(el, val);
+        }
+      }
+    } catch {
+      /* 個別要素の失敗は無視。可能な限り進める */
+    }
+  }
+}
+
+// フォーム内に checkbox が1つでもあって、まだ何もチェックされていなければ先頭をチェック。
+// (processCheckboxes は agree 系か "name 同一が2個以上" でしかチェックしないため、
+//  単独 checkbox が必須なケースを救う)
+async function ensureAtLeastOneCheckboxChecked(
+  form: ElementHandle<Element>,
+): Promise<void> {
+  const checkboxes = await form.$$('input[type="checkbox"]');
+  if (checkboxes.length === 0) return;
+  const anyChecked = await form.$$eval(
+    'input[type="checkbox"]',
+    (els) => (els as HTMLInputElement[]).some((cb) => cb.checked),
+  );
+  if (!anyChecked) {
+    try {
+      await (checkboxes[0] as ElementHandle<HTMLInputElement>).check({ force: true });
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
 // ============= Radio handling =============
 
 async function processRadios(form: ElementHandle<Element>): Promise<void> {
@@ -591,6 +743,12 @@ export async function submitForm(
     await processSelects(form);
     await processCheckboxes(form);
     await processRadios(form);
+
+    // 4) 最終セーフティネット: required 属性付きで未充填の要素をすべて埋める
+    //    (input/textarea/checkbox/radio/select/date/number 等を網羅)
+    await ensureAllRequiredFilled(page, form, input);
+    // checkbox が1つもチェックされていなければ先頭をチェック (必須同意ボックス対策)
+    await ensureAtLeastOneCheckboxChecked(form);
 
     const submitBtn = await findSubmitButton(form);
     if (!submitBtn) {
