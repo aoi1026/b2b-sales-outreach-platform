@@ -15,7 +15,7 @@ type ListOption = { id: string; name: string; companyCount: number };
 type MsgOption = { id: string; name: string; subject: string };
 type SenderOption = { id: string; name: string; companyName: string; personName: string };
 
-const MAX_COMPANIES = 50;
+const MAX_COMPANIES = 220;
 
 export default function NewJobClient({
   cases,

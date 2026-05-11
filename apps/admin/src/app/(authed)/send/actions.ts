@@ -7,7 +7,7 @@ import { prisma } from "@/lib/db";
 import { requireUser } from "@/lib/auth";
 import { enqueueDeliveryJob } from "@/lib/queue";
 
-const MAX_COMPANIES = 50;
+const MAX_COMPANIES = 220;
 
 const createSchema = z.object({
   caseId: z.string().min(1),
