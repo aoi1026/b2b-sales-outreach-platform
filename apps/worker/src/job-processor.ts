@@ -168,6 +168,8 @@ export async function processDeliveryJob(
       email: job.senderTemplate?.email ?? null,
       phone: job.senderTemplate?.phone ?? null,
       postalCode: job.senderTemplate?.postalCode ?? null,
+      address: job.senderTemplate?.address ?? null,
+      url: job.senderTemplate?.url ?? null,
       subject: applyVars(job.messageTemplate.subject, company.name),
       message: applyVars(job.messageTemplate.body, company.name),
       position: "担当者",

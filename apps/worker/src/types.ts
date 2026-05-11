@@ -10,6 +10,8 @@ export type FormInput = {
   email?: string | null;
   phone?: string | null;
   postalCode?: string | null;
+  address?: string | null;
+  url?: string | null;
   subject?: string | null;
   message?: string | null;
   position?: string | null;
