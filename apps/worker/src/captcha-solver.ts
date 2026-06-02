@@ -1,0 +1,273 @@
+import type { Page } from "playwright";
+
+const API_KEY = process.env["TWOCAPTCHA_API_KEY"];
+const BASE_URL = "https://api.2captcha.com";
+
+type CaptchaType = "recaptcha-v2" | "recaptcha-v3" | "turnstile";
+
+export type CaptchaInfo = {
+  type: CaptchaType;
+  siteKey: string;
+  pageAction?: string;
+};
+
+type CreateTaskResponse = {
+  errorId: number;
+  errorCode?: string;
+  errorDescription?: string;
+  taskId?: number;
+};
+
+type TaskResultResponse = {
+  errorId: number;
+  errorCode?: string;
+  errorDescription?: string;
+  status?: "processing" | "ready";
+  solution?: {
+    gRecaptchaResponse?: string;
+    token?: string;
+  };
+};
+
+async function createTask(task: Record<string, unknown>): Promise<number> {
+  const res = await fetch(`${BASE_URL}/createTask`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ clientKey: API_KEY, task }),
+  });
+  const data = (await res.json()) as CreateTaskResponse;
+  if (data.errorId !== 0 || !data.taskId) {
+    throw new Error(
+      `2captcha createTask failed: ${data.errorCode ?? ""} ${data.errorDescription ?? ""}`.trim(),
+    );
+  }
+  return data.taskId;
+}
+
+async function pollTaskResult(taskId: number): Promise<string> {
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 5_000));
+    const res = await fetch(`${BASE_URL}/getTaskResult`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ clientKey: API_KEY, taskId }),
+    });
+    const data = (await res.json()) as TaskResultResponse;
+    if (data.errorId !== 0) {
+      throw new Error(
+        `2captcha getTaskResult failed: ${data.errorCode ?? ""} ${data.errorDescription ?? ""}`.trim(),
+      );
+    }
+    if (data.status === "ready") {
+      return data.solution?.gRecaptchaResponse ?? data.solution?.token ?? "";
+    }
+  }
+}
+
+// Detect which captcha (if any) is present on the current page.
+// Checks Turnstile → reCAPTCHA v2 → reCAPTCHA v3 in priority order.
+export async function detectCaptcha(page: Page): Promise<CaptchaInfo | null> {
+  return await page.evaluate((): {
+    type: "recaptcha-v2" | "recaptcha-v3" | "turnstile";
+    siteKey: string;
+    pageAction?: string;
+  } | null => {
+    // 1. Cloudflare Turnstile: div.cf-turnstile or data-widget-type=challenge
+    const turnstileEl = document.querySelector<HTMLElement>(
+      ".cf-turnstile[data-sitekey], [data-widget-type='challenge'][data-sitekey]",
+    );
+    if (turnstileEl) {
+      const siteKey = turnstileEl.getAttribute("data-sitekey");
+      if (siteKey) return { type: "turnstile", siteKey };
+    }
+    // Turnstile via iframe src
+    for (const iframe of Array.from(document.querySelectorAll<HTMLIFrameElement>("iframe"))) {
+      if (iframe.src.includes("challenges.cloudflare.com/turnstile")) {
+        const parent = iframe.closest<HTMLElement>("[data-sitekey]");
+        const siteKey = parent?.getAttribute("data-sitekey");
+        if (siteKey) return { type: "turnstile", siteKey };
+      }
+    }
+
+    // 2. reCAPTCHA v2: div.g-recaptcha with data-sitekey
+    const v2El = document.querySelector<HTMLElement>(".g-recaptcha[data-sitekey]");
+    if (v2El) {
+      const siteKey = v2El.getAttribute("data-sitekey");
+      if (siteKey) return { type: "recaptcha-v2", siteKey };
+    }
+    // v2 via iframe src (api2 / enterprise)
+    for (const iframe of Array.from(document.querySelectorAll<HTMLIFrameElement>("iframe"))) {
+      if (
+        iframe.src.includes("google.com/recaptcha/api2") ||
+        iframe.src.includes("recaptcha.net/recaptcha/api2") ||
+        iframe.src.includes("google.com/recaptcha/enterprise")
+      ) {
+        const parent = iframe.closest<HTMLElement>("[data-sitekey]");
+        const siteKey = parent?.getAttribute("data-sitekey");
+        if (siteKey) return { type: "recaptcha-v2", siteKey };
+      }
+    }
+
+    // 3. reCAPTCHA v3: script src with ?render=SITEKEY or inline grecaptcha.execute call
+    for (const script of Array.from(document.querySelectorAll<HTMLScriptElement>("script"))) {
+      const src = script.src ?? "";
+      const srcMatch = src.match(/[?&]render=([^&]+)/);
+      if (srcMatch?.[1] && srcMatch[1] !== "explicit") {
+        return { type: "recaptcha-v3", siteKey: decodeURIComponent(srcMatch[1]), pageAction: "submit" };
+      }
+      const content = script.textContent ?? "";
+      const inlineMatch = content.match(/grecaptcha\.execute\(\s*['"]([^'"]+)['"]/);
+      if (inlineMatch?.[1]) {
+        const actionMatch = content.match(/[{,]\s*action\s*:\s*['"]([^'"]+)['"]/);
+        return {
+          type: "recaptcha-v3",
+          siteKey: inlineMatch[1],
+          pageAction: actionMatch?.[1] ?? "submit",
+        };
+      }
+    }
+
+    return null;
+  });
+}
+
+async function solve(websiteURL: string, info: CaptchaInfo): Promise<string> {
+  let taskId: number;
+
+  if (info.type === "recaptcha-v2") {
+    taskId = await createTask({
+      type: "RecaptchaV2TaskProxyless",
+      websiteURL,
+      websiteKey: info.siteKey,
+    });
+  } else if (info.type === "recaptcha-v3") {
+    taskId = await createTask({
+      type: "RecaptchaV3TaskProxyless",
+      websiteURL,
+      websiteKey: info.siteKey,
+      pageAction: info.pageAction ?? "submit",
+      minScore: 0.7,
+      isEnterprise: false,
+    });
+  } else {
+    // turnstile
+    taskId = await createTask({
+      type: "TurnstileTaskProxyless",
+      websiteURL,
+      websiteKey: info.siteKey,
+    });
+  }
+
+  return await pollTaskResult(taskId);
+}
+
+async function injectToken(page: Page, info: CaptchaInfo, token: string): Promise<void> {
+  if (info.type === "recaptcha-v2") {
+    await page.evaluate((t) => {
+      // Make the hidden textarea visible and set the token
+      const textarea = document.querySelector<HTMLTextAreaElement>(
+        "#g-recaptcha-response, textarea[name='g-recaptcha-response']",
+      );
+      if (textarea) {
+        textarea.style.display = "block";
+        textarea.value = t;
+        textarea.dispatchEvent(new Event("input", { bubbles: true }));
+        textarea.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      // Fire the data-callback if defined on the widget div
+      const container = document.querySelector<HTMLElement>(".g-recaptcha");
+      const callbackName = container?.getAttribute("data-callback");
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const win = window as any;
+      if (callbackName && typeof win[callbackName] === "function") {
+        win[callbackName](t);
+      }
+    }, token);
+    return;
+  }
+
+  if (info.type === "recaptcha-v3") {
+    await page.evaluate((t) => {
+      // Override grecaptcha.execute so the site receives our pre-solved token
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const win = window as any;
+      if (win.grecaptcha) {
+        win.grecaptcha.execute = () => Promise.resolve(t);
+        if (typeof win.grecaptcha.ready === "function") {
+          // Already ready — call immediately; some sites invoke execute inside ready()
+          win.grecaptcha.ready = (cb: () => void) => cb();
+        }
+      }
+      // Fallback: set any hidden g-recaptcha-response field
+      const el = document.querySelector<HTMLInputElement | HTMLTextAreaElement>(
+        "input[name='g-recaptcha-response'], textarea[name='g-recaptcha-response']",
+      );
+      if (el) {
+        el.value = t;
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+    }, token);
+    return;
+  }
+
+  // turnstile
+  await page.evaluate((t) => {
+    const input = document.querySelector<HTMLInputElement>("input[name='cf-turnstile-response']");
+    if (input) {
+      input.value = t;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+    // Fire data-callback if defined on the widget container
+    const container = document.querySelector<HTMLElement>(".cf-turnstile");
+    const callbackName = container?.getAttribute("data-callback");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const win = window as any;
+    if (callbackName && typeof win[callbackName] === "function") {
+      win[callbackName](t);
+    }
+    // Also try window.turnstile callback pattern
+    if (win.turnstile?.execute) {
+      try { win.turnstile.execute(); } catch { /* ignore */ }
+    }
+  }, token);
+}
+
+export type CaptchaSolveHandle = {
+  info: CaptchaInfo;
+  tokenPromise: Promise<string>;
+};
+
+/**
+ * Detects any captcha on the page and starts solving it via 2captcha in the background.
+ * Returns a handle to await later (via injectCaptchaToken), or null if:
+ *   - TWOCAPTCHA_API_KEY is not set
+ *   - no captcha is detected on the page
+ */
+export async function startCaptchaSolve(page: Page): Promise<CaptchaSolveHandle | null> {
+  if (!API_KEY) return null;
+
+  const info = await detectCaptcha(page);
+  if (!info) return null;
+
+  const websiteURL = page.url();
+  const tokenPromise = solve(websiteURL, info).catch((err: unknown) => {
+    console.warn("[captcha-solver] solve failed:", (err as Error).message ?? err);
+    return "";
+  });
+
+  return { info, tokenPromise };
+}
+
+/**
+ * Awaits the token from startCaptchaSolve and injects it into the page.
+ * Call this just before clicking the submit button.
+ */
+export async function injectCaptchaToken(
+  page: Page,
+  handle: CaptchaSolveHandle,
+): Promise<void> {
+  const token = await handle.tokenPromise;
+  if (!token) return;
+  await injectToken(page, handle.info, token);
+}

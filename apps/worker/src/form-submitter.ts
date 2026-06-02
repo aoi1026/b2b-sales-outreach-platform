@@ -1,5 +1,6 @@
 import { chromium, type Browser, type Page, type ElementHandle } from "playwright";
 import type { FormInput, SubmitResult } from "./types.ts";
+import { startCaptchaSolve, injectCaptchaToken, type CaptchaSolveHandle } from "./captcha-solver.ts";
 
 let browserInstance: Browser | null = null;
 
@@ -1262,7 +1263,15 @@ export async function submitForm(
   input: FormInput,
 ): Promise<SubmitResult> {
   const browser = await getBrowser();
-  const context = await browser.newContext({ userAgent: USER_AGENT });
+  const proxyServer = process.env["PROXY_SERVER"];
+  const proxyUsername = process.env["PROXY_USERNAME"];
+  const proxyPassword = process.env["PROXY_PASSWORD"];
+  const context = await browser.newContext({
+    userAgent: USER_AGENT,
+    ...(proxyServer
+      ? { proxy: { server: proxyServer, username: proxyUsername, password: proxyPassword } }
+      : {}),
+  });
   const page = await context.newPage();
   try {
     const response = await page.goto(formUrl, {
@@ -1287,6 +1296,14 @@ export async function submitForm(
         errorMessage: "送信可能なフォームを検出できませんでした。",
         httpStatus,
       };
+    }
+
+    // キャプチャ検出 → バックグラウンドで解決開始 (フォーム充填と並行して待機)
+    let captchaHandle: CaptchaSolveHandle | null = null;
+    try {
+      captchaHandle = await startCaptchaSolve(page);
+    } catch {
+      /* キャプチャ検出に失敗しても処理を続行 */
     }
 
     // 1) tel × 3 / zip × 2 のような分割入力欄を先に埋める (ユーザ要件)
@@ -1315,6 +1332,15 @@ export async function submitForm(
     await ensureAgreementsChecked(page, form);
     // checkbox が1つもチェックされていなければ先頭をチェック (必須同意ボックス対策)
     await ensureAtLeastOneCheckboxChecked(page, form);
+
+    // キャプチャトークンをページに注入 (バックグラウンド解決の完了を待つ)
+    if (captchaHandle) {
+      try {
+        await injectCaptchaToken(page, captchaHandle);
+      } catch {
+        /* 注入失敗は無視して送信を試みる */
+      }
+    }
 
     const submitBtn = await findSubmitButton(form, page);
     if (!submitBtn) {

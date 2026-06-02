@@ -45,6 +45,14 @@ Thumbs.db
 # misc
 *.tmp
 
+# screenshots / images (dev only)
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+dashboard images/
+
 # LP dummy form received log (dev only)
 apps/lp/.received-log.jsonl
 
