@@ -44,9 +44,15 @@ async function createTask(task: Record<string, unknown>): Promise<number> {
   return data.taskId;
 }
 
+const CAPTCHA_POLL_TIMEOUT_MS = 120_000; // 2 minutes max
+
 async function pollTaskResult(taskId: number): Promise<string> {
+  const deadline = Date.now() + CAPTCHA_POLL_TIMEOUT_MS;
   for (;;) {
     await new Promise((r) => setTimeout(r, 5_000));
+    if (Date.now() >= deadline) {
+      throw new Error(`2captcha polling timed out after ${CAPTCHA_POLL_TIMEOUT_MS / 1000}s (taskId=${taskId})`);
+    }
     const res = await fetch(`${BASE_URL}/getTaskResult`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
