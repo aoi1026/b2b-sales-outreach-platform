@@ -36,7 +36,8 @@ function LoginForm() {
       setError(data.error ?? "ログインに失敗しました。");
       return;
     }
-    router.replace(redirectTo);
+    const sep = redirectTo.includes("?") ? "&" : "?";
+    router.replace(`${redirectTo}${sep}welcome=1`);
     router.refresh();
   }
 
