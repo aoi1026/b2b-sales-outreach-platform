@@ -1,3 +1,5 @@
+import { mkdirSync } from "fs";
+import { join } from "path";
 import pkg from "../../../packages/db/generated/prisma/index.js";
 import { submitForm } from "./form-submitter.ts";
 import type { DeliveryJobPayload, FormInput } from "./types.ts";
@@ -9,6 +11,10 @@ const INTER_COMPANY_DELAY_MS = 2000;
 const MAX_ATTEMPTS = 3;
 // 1社あたりの全リトライ含む最大処理時間。これを超えると TIMEOUT 扱いで次社へ。
 const PER_COMPANY_TIMEOUT_MS = 180_000;
+
+function sanitizeName(name: string): string {
+  return name.replace(/[\\/:*?"<>|]/g, "_").slice(0, 80);
+}
 
 function applyVars(text: string, companyName: string): string {
   return text
@@ -89,6 +95,15 @@ export async function processDeliveryJob(
     where: { id: jobId },
     data: { status: "RUNNING", startedAt: job.startedAt ?? new Date() },
   });
+
+  const screenshotEnabled = process.env["WORKER_SCREENSHOT"] === "true";
+  const screenshotDir = screenshotEnabled
+    ? join(process.env["WORKER_SCREENSHOT_DIR"] ?? "./screenshots", jobId)
+    : null;
+  if (screenshotDir) {
+    mkdirSync(screenshotDir, { recursive: true });
+    console.log(`[worker] screenshots → ${screenshotDir}`);
+  }
 
   const blEntries = await prisma.blacklistEntry.findMany();
   const blDomains = new Set(
@@ -196,8 +211,11 @@ export async function processDeliveryJob(
       };
       for (let i = 0; i < MAX_ATTEMPTS; i++) {
         attempts++;
+        const screenshotPath = screenshotDir
+          ? join(screenshotDir, `${sanitizeName(company.name)}_attempt${i + 1}.png`)
+          : undefined;
         try {
-          last = await submitForm(company.formUrl, input);
+          last = await submitForm(company.formUrl, input, { screenshotPath });
           if (last.status === "success") break;
         } catch (e) {
           last = {

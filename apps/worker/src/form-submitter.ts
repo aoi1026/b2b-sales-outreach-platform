@@ -1261,6 +1261,7 @@ async function hasVisibleErrorElement(page: Page): Promise<boolean> {
 export async function submitForm(
   formUrl: string,
   input: FormInput,
+  options?: { screenshotPath?: string },
 ): Promise<SubmitResult> {
   const browser = await getBrowser();
   const proxyServer = process.env["PROXY_SERVER"];
@@ -1373,8 +1374,13 @@ export async function submitForm(
     }
 
     // 遅延表示されるインラインエラー (JS で fetch 後に DOM 挿入されるパターン) を
-    // 拾うため、さらに少し待ってから判定する
-    await page.waitForTimeout(800);
+    // 拾うため、さらに少し待ってから判定する。
+    // スクリーンショットが有効な場合は最終ボタン押下から 3 秒間待機してから撮影。
+    await page.waitForTimeout(options?.screenshotPath ? 3000 : 800);
+
+    if (options?.screenshotPath) {
+      await page.screenshot({ path: options.screenshotPath, fullPage: true }).catch(() => null);
+    }
 
     const urlAfter = page.url();
     const content = await page.content().catch(() => "");
