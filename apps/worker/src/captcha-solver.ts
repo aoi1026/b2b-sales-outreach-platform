@@ -9,6 +9,8 @@ export type CaptchaInfo = {
   type: CaptchaType;
   siteKey: string;
   pageAction?: string;
+  // reCAPTCHA Enterprise (v2/v3) は 2captcha 側で専用タスクが必要なため区別する
+  isEnterprise?: boolean;
 };
 
 type CreateTaskResponse = {
@@ -77,6 +79,7 @@ export async function detectCaptcha(page: Page): Promise<CaptchaInfo | null> {
     type: "recaptcha-v2" | "recaptcha-v3" | "turnstile";
     siteKey: string;
     pageAction?: string;
+    isEnterprise?: boolean;
   } | null => {
     // 1. Cloudflare Turnstile: div.cf-turnstile or data-widget-type=challenge
     const turnstileEl = document.querySelector<HTMLElement>(
@@ -103,32 +106,42 @@ export async function detectCaptcha(page: Page): Promise<CaptchaInfo | null> {
     }
     // v2 via iframe src (api2 / enterprise)
     for (const iframe of Array.from(document.querySelectorAll<HTMLIFrameElement>("iframe"))) {
+      const isEnterprise = iframe.src.includes("/recaptcha/enterprise");
       if (
         iframe.src.includes("google.com/recaptcha/api2") ||
         iframe.src.includes("recaptcha.net/recaptcha/api2") ||
-        iframe.src.includes("google.com/recaptcha/enterprise")
+        isEnterprise
       ) {
         const parent = iframe.closest<HTMLElement>("[data-sitekey]");
         const siteKey = parent?.getAttribute("data-sitekey");
-        if (siteKey) return { type: "recaptcha-v2", siteKey };
+        if (siteKey) return { type: "recaptcha-v2", siteKey, isEnterprise };
       }
     }
 
     // 3. reCAPTCHA v3: script src with ?render=SITEKEY or inline grecaptcha.execute call
     for (const script of Array.from(document.querySelectorAll<HTMLScriptElement>("script"))) {
       const src = script.src ?? "";
+      // Enterprise は enterprise.js を読み込む (api.js は通常版)
+      const isEnterprise = src.includes("/recaptcha/enterprise.js") || src.includes("/enterprise.js");
       const srcMatch = src.match(/[?&]render=([^&]+)/);
       if (srcMatch?.[1] && srcMatch[1] !== "explicit") {
-        return { type: "recaptcha-v3", siteKey: decodeURIComponent(srcMatch[1]), pageAction: "submit" };
+        return {
+          type: "recaptcha-v3",
+          siteKey: decodeURIComponent(srcMatch[1]),
+          pageAction: "submit",
+          isEnterprise,
+        };
       }
       const content = script.textContent ?? "";
-      const inlineMatch = content.match(/grecaptcha\.execute\(\s*['"]([^'"]+)['"]/);
+      // grecaptcha.execute(...) / grecaptcha.enterprise.execute(...)
+      const inlineMatch = content.match(/grecaptcha(?:\.enterprise)?\.execute\(\s*['"]([^'"]+)['"]/);
       if (inlineMatch?.[1]) {
         const actionMatch = content.match(/[{,]\s*action\s*:\s*['"]([^'"]+)['"]/);
         return {
           type: "recaptcha-v3",
           siteKey: inlineMatch[1],
           pageAction: actionMatch?.[1] ?? "submit",
+          isEnterprise: content.includes("grecaptcha.enterprise"),
         };
       }
     }
@@ -141,19 +154,23 @@ async function solve(websiteURL: string, info: CaptchaInfo): Promise<string> {
   let taskId: number;
 
   if (info.type === "recaptcha-v2") {
+    // Enterprise 版は専用タスク (RecaptchaV2EnterpriseTaskProxyless) が必要
     taskId = await createTask({
-      type: "RecaptchaV2TaskProxyless",
+      type: info.isEnterprise
+        ? "RecaptchaV2EnterpriseTaskProxyless"
+        : "RecaptchaV2TaskProxyless",
       websiteURL,
       websiteKey: info.siteKey,
     });
   } else if (info.type === "recaptcha-v3") {
+    // Enterprise v3 は同じタスク型で isEnterprise: true を指定する
     taskId = await createTask({
       type: "RecaptchaV3TaskProxyless",
       websiteURL,
       websiteKey: info.siteKey,
       pageAction: info.pageAction ?? "submit",
       minScore: 0.7,
-      isEnterprise: false,
+      isEnterprise: info.isEnterprise ?? false,
     });
   } else {
     // turnstile
@@ -197,11 +214,13 @@ async function injectToken(page: Page, info: CaptchaInfo, token: string): Promis
       // Override grecaptcha.execute so the site receives our pre-solved token
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const win = window as any;
-      if (win.grecaptcha) {
-        win.grecaptcha.execute = () => Promise.resolve(t);
-        if (typeof win.grecaptcha.ready === "function") {
+      // 通常版・Enterprise 版どちらの execute/ready も差し替える
+      for (const g of [win.grecaptcha, win.grecaptcha?.enterprise]) {
+        if (!g) continue;
+        g.execute = () => Promise.resolve(t);
+        if (typeof g.ready === "function") {
           // Already ready — call immediately; some sites invoke execute inside ready()
-          win.grecaptcha.ready = (cb: () => void) => cb();
+          g.ready = (cb: () => void) => cb();
         }
       }
       // Fallback: set any hidden g-recaptcha-response field

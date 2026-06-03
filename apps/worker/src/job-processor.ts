@@ -80,7 +80,8 @@ export async function processDeliveryJob(
       list: { include: { companies: true } },
       messageTemplate: true,
       senderTemplate: true,
-      results: true,
+      // screenshot (PNG bytes) は不要かつ重いので除外
+      results: { omit: { screenshot: true } },
     },
   });
   if (!job) {
@@ -259,6 +260,7 @@ export async function processDeliveryJob(
           httpStatus: finalResult.httpStatus ?? null,
           errorType: null,
           errorMessage: null,
+          screenshot: finalResult.screenshot ? new Uint8Array(finalResult.screenshot) : null,
         },
       });
     } else {
@@ -272,6 +274,7 @@ export async function processDeliveryJob(
           httpStatus: finalResult?.httpStatus ?? null,
           errorType: finalResult?.errorType ?? "UNKNOWN",
           errorMessage: finalResult?.errorMessage ?? "不明なエラー",
+          screenshot: finalResult?.screenshot ? new Uint8Array(finalResult.screenshot) : null,
         },
       });
     }

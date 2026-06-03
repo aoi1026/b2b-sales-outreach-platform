@@ -29,12 +29,22 @@ export default async function SendJobDetailPage({
       messageTemplate: true,
       senderTemplate: true,
       results: {
+        // screenshot (PNG bytes) は重いので一覧クエリでは取得しない。
+        // 実体は /api/send/screenshot/[id] 経由で個別に配信する。
+        omit: { screenshot: true },
         include: { company: true },
         orderBy: { createdAt: "asc" },
       },
     },
   });
   if (!job) notFound();
+
+  // スクリーンショットを保持している結果の id 集合 (バイト列は読まずに存在判定のみ)
+  const withShot = await prisma.deliveryResult.findMany({
+    where: { jobId: id, screenshot: { not: null } },
+    select: { id: true },
+  });
+  const shotIds = new Set(withShot.map((r) => r.id));
 
   const processed = job.successCount + job.failedCount + job.skippedCount;
   const progressPct =
@@ -189,6 +199,7 @@ export default async function SendJobDetailPage({
               <th className="text-left px-3 py-2 font-medium">エラー</th>
               <th className="text-left px-3 py-2 font-medium w-16">試行</th>
               <th className="text-left px-3 py-2 font-medium w-32">実行時刻</th>
+              <th className="text-left px-3 py-2 font-medium w-28">スクリーンショット</th>
             </tr>
           </thead>
           <tbody>
@@ -217,6 +228,25 @@ export default async function SendJobDetailPage({
                 <td className="px-3 py-2 text-xs text-gray-600">{r.attempts}</td>
                 <td className="px-3 py-2 text-xs text-gray-600 whitespace-nowrap">
                   {fmtJstTime(r.attemptedAt)}
+                </td>
+                <td className="px-3 py-2">
+                  {shotIds.has(r.id) ? (
+                    <a
+                      href={`/api/send/screenshot/${r.id}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      title="クリックで拡大表示"
+                    >
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img
+                        src={`/api/send/screenshot/${r.id}`}
+                        alt={`${r.company.name} のスクリーンショット`}
+                        className="h-12 w-20 object-cover object-top border border-gray-200 rounded hover:ring-2 hover:ring-[#1e5ab4]"
+                      />
+                    </a>
+                  ) : (
+                    <span className="text-xs text-gray-400">—</span>
+                  )}
                 </td>
               </tr>
             ))}

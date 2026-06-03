@@ -1258,6 +1258,26 @@ async function hasVisibleErrorElement(page: Page): Promise<boolean> {
 
 // ============= Main =============
 
+// 成功・失敗を問わず、現在のページの最終画面を全画面 PNG で撮影し result に添付する。
+// screenshotPath 指定時はファイルにも保存する (dev 用)。撮影失敗は握り潰す。
+async function attachShot(
+  page: Page,
+  options: { screenshotPath?: string } | undefined,
+  result: SubmitResult,
+): Promise<SubmitResult> {
+  try {
+    const buf = await page.screenshot({
+      fullPage: true,
+      timeout: 15_000,
+      ...(options?.screenshotPath ? { path: options.screenshotPath } : {}),
+    });
+    if (buf) result.screenshot = buf;
+  } catch {
+    /* ページが閉じている / 撮影タイムアウト等は無視 */
+  }
+  return result;
+}
+
 export async function submitForm(
   formUrl: string,
   input: FormInput,
@@ -1281,22 +1301,22 @@ export async function submitForm(
     });
     const httpStatus = response?.status() ?? 0;
     if (httpStatus >= 400) {
-      return {
+      return await attachShot(page, options, {
         status: "failed",
         errorType: "NETWORK_ERROR",
         errorMessage: `HTTP ${httpStatus}`,
         httpStatus,
-      };
+      });
     }
 
     const form = await pickBestForm(page);
     if (!form) {
-      return {
+      return await attachShot(page, options, {
         status: "failed",
         errorType: "FORM_NOT_FOUND",
         errorMessage: "送信可能なフォームを検出できませんでした。",
         httpStatus,
-      };
+      });
     }
 
     // キャプチャ検出 → バックグラウンドで解決開始 (フォーム充填と並行して待機)
@@ -1313,12 +1333,12 @@ export async function submitForm(
     // 2) 通常のテキスト/textarea/email/tel フィールドを埋める
     const filled = await fillTextLikeFields(page, form, input, consumedNames);
     if (filled === 0 && consumedNames.size === 0) {
-      return {
+      return await attachShot(page, options, {
         status: "failed",
         errorType: "FIELD_MISMATCH",
         errorMessage: "フォーム項目にマッピングできませんでした。",
         httpStatus,
-      };
+      });
     }
 
     // 3) <select>, checkbox, radio を処理 (radios/checkboxes は label 経由 click 対応)
@@ -1345,12 +1365,12 @@ export async function submitForm(
 
     const submitBtn = await findSubmitButton(form, page);
     if (!submitBtn) {
-      return {
+      return await attachShot(page, options, {
         status: "failed",
         errorType: "SUBMIT_FAILED",
         errorMessage: "送信ボタンが見つかりませんでした。",
         httpStatus,
-      };
+      });
     }
 
     const urlBefore = page.url();
@@ -1374,13 +1394,8 @@ export async function submitForm(
     }
 
     // 遅延表示されるインラインエラー (JS で fetch 後に DOM 挿入されるパターン) を
-    // 拾うため、さらに少し待ってから判定する。
-    // スクリーンショットが有効な場合は最終ボタン押下から 3 秒間待機してから撮影。
-    await page.waitForTimeout(options?.screenshotPath ? 3000 : 800);
-
-    if (options?.screenshotPath) {
-      await page.screenshot({ path: options.screenshotPath, fullPage: true }).catch(() => null);
-    }
+    // 拾うため、さらに少し待ってから判定する。最終画面を確実に撮るため少し長めに待つ。
+    await page.waitForTimeout(2000);
 
     const urlAfter = page.url();
     const content = await page.content().catch(() => "");
@@ -1390,43 +1405,40 @@ export async function submitForm(
     await logInvalidFields(page);
 
     // 1) 明示的な成功文言
-    if (isSuccessContent(content)) return { status: "success", httpStatus };
+    if (isSuccessContent(content))
+      return await attachShot(page, options, { status: "success", httpStatus });
 
     // 2) 画面上のエラー要素 / エラー文言 → バリデーションエラー扱い
     if (isErrorContent(content) || (await hasVisibleErrorElement(page)))
-      return {
+      return await attachShot(page, options, {
         status: "failed",
         errorType: "VALIDATION_ERROR",
         errorMessage: "バリデーションエラーと思われる応答を検出しました。",
         httpStatus,
-      };
+      });
 
     // 3) URL が thanks/complete 系に遷移していれば成功
-    if (looksLikeSuccessUrl(urlAfter)) return { status: "success", httpStatus };
+    if (looksLikeSuccessUrl(urlAfter))
+      return await attachShot(page, options, { status: "success", httpStatus });
 
     // 4) URL は変わったがエラー文言が無い → 成功と推定 (確認画面を経た送信完了など)
-    if (urlBefore !== urlAfter) return { status: "success", httpStatus };
+    if (urlBefore !== urlAfter)
+      return await attachShot(page, options, { status: "success", httpStatus });
 
-    return {
+    return await attachShot(page, options, {
       status: "failed",
       errorType: "UNKNOWN",
       errorMessage: "送信後のページが成功と判定できませんでした。",
       httpStatus,
-    };
+    });
   } catch (e) {
     const err = e as Error;
-    if (err.name === "TimeoutError") {
-      return {
-        status: "failed",
-        errorType: "TIMEOUT",
-        errorMessage: err.message,
-      };
-    }
-    return {
-      status: "failed",
-      errorType: "UNKNOWN",
-      errorMessage: err.message || String(e),
-    };
+    // 例外時 (タイムアウト/ナビゲーション失敗など) も、可能なら最終画面を残す。
+    const result: SubmitResult =
+      err.name === "TimeoutError"
+        ? { status: "failed", errorType: "TIMEOUT", errorMessage: err.message }
+        : { status: "failed", errorType: "UNKNOWN", errorMessage: err.message || String(e) };
+    return await attachShot(page, options, result);
   } finally {
     await page.close().catch(() => null);
     await context.close().catch(() => null);

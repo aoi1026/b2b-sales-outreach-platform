@@ -70,6 +70,7 @@ export default async function SendLogPage({
       orderBy: { attemptedAt: "desc" },
       skip: (page - 1) * PAGE_SIZE,
       take: PAGE_SIZE,
+      omit: { screenshot: true },
       include: {
         job: { include: { case: true, list: true } },
         company: true,

@@ -232,6 +232,8 @@ model DeliveryResult {
   errorMessage String?              @map("error_message") @db.Text
   httpStatus   Int?                 @map("http_status")
   attempts     Int                  @default(0)
+  // 送信時の全画面スクリーンショット (PNG)。WORKER_SCREENSHOT=true のときのみ保存。
+  screenshot   Bytes?
   attemptedAt  DateTime?            @map("attempted_at")
   createdAt    DateTime             @default(now()) @map("created_at")
   updatedAt    DateTime             @updatedAt @map("updated_at")

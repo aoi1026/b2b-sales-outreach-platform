@@ -29,6 +29,8 @@ export type SubmitResult = {
     | "UNKNOWN";
   errorMessage?: string;
   httpStatus?: number;
+  // 送信完了時の全画面スクリーンショット (PNG)。撮影が有効な場合のみ。
+  screenshot?: Buffer;
 };
 
 export type DeliveryJobPayload = {

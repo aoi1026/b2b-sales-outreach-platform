@@ -52,6 +52,7 @@ export async function GET(req: Request) {
   const rows = await prisma.deliveryResult.findMany({
     where,
     orderBy: { attemptedAt: "desc" },
+    omit: { screenshot: true },
     include: {
       job: { include: { case: true, list: true, messageTemplate: true } },
       company: true,
