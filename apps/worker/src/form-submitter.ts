@@ -1258,23 +1258,33 @@ async function hasVisibleErrorElement(page: Page): Promise<boolean> {
 
 // ============= Main =============
 
-// 成功・失敗を問わず、現在のページの最終画面を全画面 PNG で撮影し result に添付する。
-// screenshotPath 指定時はファイルにも保存する (dev 用)。撮影失敗は握り潰す。
-async function attachShot(
+// 現在のページの最終画面を全画面 PNG で撮影して返す。
+// screenshotPath 指定時はファイルにも保存する (dev 用)。撮影失敗は undefined。
+async function takeShot(
   page: Page,
   options: { screenshotPath?: string } | undefined,
-  result: SubmitResult,
-): Promise<SubmitResult> {
+): Promise<Buffer | undefined> {
   try {
     const buf = await page.screenshot({
       fullPage: true,
       timeout: 15_000,
       ...(options?.screenshotPath ? { path: options.screenshotPath } : {}),
     });
-    if (buf) result.screenshot = buf;
+    return buf ?? undefined;
   } catch {
     /* ページが閉じている / 撮影タイムアウト等は無視 */
+    return undefined;
   }
+}
+
+// 成功・失敗を問わず、現在のページの最終画面を撮影し result に添付する。
+async function attachShot(
+  page: Page,
+  options: { screenshotPath?: string } | undefined,
+  result: SubmitResult,
+): Promise<SubmitResult> {
+  const buf = await takeShot(page, options);
+  if (buf) result.screenshot = buf;
   return result;
 }
 
@@ -1393,9 +1403,12 @@ export async function submitForm(
       await waitForFormResponse(page);
     }
 
-    // 遅延表示されるインラインエラー (JS で fetch 後に DOM 挿入されるパターン) を
-    // 拾うため、さらに少し待ってから判定する。最終画面を確実に撮るため少し長めに待つ。
-    await page.waitForTimeout(2000);
+    // 最終送信ボタン押下時刻を基準にタイミング制御する。
+    const submittedAt = Date.now();
+
+    // ユーザ要件: 最終送信ボタン押下から「1秒後」にスクリーンショットを撮り始める。
+    await page.waitForTimeout(1000);
+    const shot = await takeShot(page, options);
 
     const urlAfter = page.url();
     const content = await page.content().catch(() => "");
@@ -1404,33 +1417,41 @@ export async function submitForm(
     // (記事の Fix #7 — どのフィールドで弾かれたか可視化する)
     await logInvalidFields(page);
 
-    // 1) 明示的な成功文言
-    if (isSuccessContent(content))
-      return await attachShot(page, options, { status: "success", httpStatus });
-
-    // 2) 画面上のエラー要素 / エラー文言 → バリデーションエラー扱い
-    if (isErrorContent(content) || (await hasVisibleErrorElement(page)))
-      return await attachShot(page, options, {
+    // 送信後ページの判定 (撮影は上で完了済み)
+    let result: SubmitResult;
+    if (isSuccessContent(content)) {
+      // 1) 明示的な成功文言
+      result = { status: "success", httpStatus };
+    } else if (isErrorContent(content) || (await hasVisibleErrorElement(page))) {
+      // 2) 画面上のエラー要素 / エラー文言 → バリデーションエラー扱い
+      result = {
         status: "failed",
         errorType: "VALIDATION_ERROR",
         errorMessage: "バリデーションエラーと思われる応答を検出しました。",
         httpStatus,
-      });
+      };
+    } else if (looksLikeSuccessUrl(urlAfter)) {
+      // 3) URL が thanks/complete 系に遷移していれば成功
+      result = { status: "success", httpStatus };
+    } else if (urlBefore !== urlAfter) {
+      // 4) URL は変わったがエラー文言が無い → 成功と推定 (確認画面を経た送信完了など)
+      result = { status: "success", httpStatus };
+    } else {
+      result = {
+        status: "failed",
+        errorType: "UNKNOWN",
+        errorMessage: "送信後のページが成功と判定できませんでした。",
+        httpStatus,
+      };
+    }
+    if (shot) result.screenshot = shot;
 
-    // 3) URL が thanks/complete 系に遷移していれば成功
-    if (looksLikeSuccessUrl(urlAfter))
-      return await attachShot(page, options, { status: "success", httpStatus });
+    // ユーザ要件: 最終送信ボタン押下からこのサイトに「7秒間」は留まってから次へ進む
+    // (スクリーンショットの取得が完了するまでの猶予を確保する)。
+    const elapsed = Date.now() - submittedAt;
+    if (elapsed < 7000) await page.waitForTimeout(7000 - elapsed);
 
-    // 4) URL は変わったがエラー文言が無い → 成功と推定 (確認画面を経た送信完了など)
-    if (urlBefore !== urlAfter)
-      return await attachShot(page, options, { status: "success", httpStatus });
-
-    return await attachShot(page, options, {
-      status: "failed",
-      errorType: "UNKNOWN",
-      errorMessage: "送信後のページが成功と判定できませんでした。",
-      httpStatus,
-    });
+    return result;
   } catch (e) {
     const err = e as Error;
     // 例外時 (タイムアウト/ナビゲーション失敗など) も、可能なら最終画面を残す。
