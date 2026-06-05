@@ -13,6 +13,7 @@ const createSchema = z.object({
   caseId: z.string().min(1),
   listId: z.string().min(1),
   messageTemplateId: z.string().min(1),
+  fallbackMessageTemplateId: z.string().optional().or(z.literal("")),
   senderTemplateId: z.string().optional().or(z.literal("")),
   note: z.string().max(300).optional(),
 });
@@ -24,6 +25,7 @@ export async function createDeliveryJobAction(formData: FormData): Promise<void>
     caseId: formData.get("caseId")?.toString() ?? "",
     listId: formData.get("listId")?.toString() ?? "",
     messageTemplateId: formData.get("messageTemplateId")?.toString() ?? "",
+    fallbackMessageTemplateId: formData.get("fallbackMessageTemplateId")?.toString() ?? "",
     senderTemplateId: formData.get("senderTemplateId")?.toString() ?? "",
     note: formData.get("note")?.toString() || undefined,
   });
@@ -47,6 +49,10 @@ export async function createDeliveryJobAction(formData: FormData): Promise<void>
       caseId: d.caseId,
       listId: d.listId,
       messageTemplateId: d.messageTemplateId,
+      fallbackMessageTemplateId:
+        d.fallbackMessageTemplateId && d.fallbackMessageTemplateId !== d.messageTemplateId
+          ? d.fallbackMessageTemplateId
+          : null,
       senderTemplateId: d.senderTemplateId || null,
       status: "PENDING",
       plannedCount: list._count.companies,

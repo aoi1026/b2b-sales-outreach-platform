@@ -134,7 +134,8 @@ model MessageTemplate {
   updatedAt DateTime @updatedAt @map("updated_at")
 
   caseTemplates CaseTemplate[]
-  deliveryJobs  DeliveryJob[]
+  deliveryJobs  DeliveryJob[] @relation("JobMainTemplate")
+  fallbackDeliveryJobs DeliveryJob[] @relation("JobFallbackTemplate")
 
   @@map("message_templates")
 }
@@ -198,6 +199,8 @@ model DeliveryJob {
   caseId            String            @map("case_id")
   listId            String            @map("list_id")
   messageTemplateId String            @map("message_template_id")
+  // 初回送信が失敗した場合に再送する短文フォールバック用テンプレート (任意)
+  fallbackMessageTemplateId String?   @map("fallback_message_template_id")
   senderTemplateId  String?           @map("sender_template_id")
   status            DeliveryJobStatus @default(PENDING)
   plannedCount      Int               @default(0) @map("planned_count")
@@ -214,7 +217,8 @@ model DeliveryJob {
 
   case            Case             @relation(fields: [caseId], references: [id], onDelete: Cascade)
   list            List             @relation(fields: [listId], references: [id], onDelete: Cascade)
-  messageTemplate MessageTemplate  @relation(fields: [messageTemplateId], references: [id], onDelete: Restrict)
+  messageTemplate MessageTemplate  @relation("JobMainTemplate", fields: [messageTemplateId], references: [id], onDelete: Restrict)
+  fallbackMessageTemplate MessageTemplate? @relation("JobFallbackTemplate", fields: [fallbackMessageTemplateId], references: [id], onDelete: SetNull)
   senderTemplate  SenderTemplate?  @relation(fields: [senderTemplateId], references: [id], onDelete: SetNull)
   results         DeliveryResult[]
 

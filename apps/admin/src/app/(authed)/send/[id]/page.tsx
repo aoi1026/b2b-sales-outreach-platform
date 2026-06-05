@@ -27,6 +27,7 @@ export default async function SendJobDetailPage({
       case: true,
       list: true,
       messageTemplate: true,
+      fallbackMessageTemplate: true,
       senderTemplate: true,
       results: {
         // screenshot (PNG bytes) は重いので一覧クエリでは取得しない。
@@ -136,6 +137,19 @@ export default async function SendJobDetailPage({
             >
               {job.messageTemplate.name}
             </Link>
+          </dd>
+          <dt className="text-gray-500">短文フォールバック</dt>
+          <dd>
+            {job.fallbackMessageTemplate ? (
+              <Link
+                href={`/templates/message/${job.fallbackMessageTemplate.id}`}
+                className="hover:text-[#1e5ab4]"
+              >
+                {job.fallbackMessageTemplate.name}
+              </Link>
+            ) : (
+              <span className="text-gray-400">（なし）</span>
+            )}
           </dd>
           <dt className="text-gray-500">送信元</dt>
           <dd>

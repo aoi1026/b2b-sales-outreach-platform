@@ -31,6 +31,7 @@ export default function NewJobClient({
   const [caseId, setCaseId] = useState("");
   const [listId, setListId] = useState("");
   const [messageTemplateId, setMessageTemplateId] = useState("");
+  const [fallbackMessageTemplateId, setFallbackMessageTemplateId] = useState("");
   const [senderTemplateId, setSenderTemplateId] = useState("");
   const [note, setNote] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -54,6 +55,7 @@ export default function NewJobClient({
 
   const selectedList = lists.find((l) => l.id === listId);
   const selectedMsg = msgTemplates.find((t) => t.id === messageTemplateId);
+  const selectedFallback = msgTemplates.find((t) => t.id === fallbackMessageTemplateId);
   const selectedSender = senderTemplates.find((s) => s.id === senderTemplateId);
 
   const canSubmit =
@@ -155,6 +157,30 @@ export default function NewJobClient({
           </div>
           <div>
             <label className="block text-xs text-gray-500 mb-1">
+              短文フォールバックテンプレート (任意)
+            </label>
+            <select
+              name="fallbackMessageTemplateId"
+              value={fallbackMessageTemplateId}
+              onChange={(e) => setFallbackMessageTemplateId(e.target.value)}
+              className="w-full border border-gray-300 rounded px-3 py-1.5 text-sm"
+              disabled={!caseId}
+            >
+              <option value="">（指定しない）</option>
+              {msgTemplates
+                .filter((t) => t.id !== messageTemplateId)
+                .map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.name}
+                  </option>
+                ))}
+            </select>
+            <p className="text-[11px] text-gray-500 mt-1">
+              本文テンプレートでの送信が失敗した場合、こちらの短い文章で自動的に再送します。
+            </p>
+          </div>
+          <div>
+            <label className="block text-xs text-gray-500 mb-1">
               送信元テンプレート (任意 / 差出人情報)
             </label>
             <select
@@ -182,6 +208,12 @@ export default function NewJobClient({
             <dd className="font-semibold">{selectedList.companyCount} 件</dd>
             <dt className="text-gray-500">件名</dt>
             <dd>{selectedMsg.subject}</dd>
+            <dt className="text-gray-500">短文フォールバック</dt>
+            <dd>
+              {selectedFallback
+                ? selectedFallback.name
+                : "（なし — 失敗時の再送はしません）"}
+            </dd>
             <dt className="text-gray-500">送信元</dt>
             <dd>
               {selectedSender

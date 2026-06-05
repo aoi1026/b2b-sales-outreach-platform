@@ -291,8 +291,15 @@ export async function startCaptchaSolve(page: Page): Promise<CaptchaSolveHandle 
 export async function injectCaptchaToken(
   page: Page,
   handle: CaptchaSolveHandle,
+  maxWaitMs = 45_000,
 ): Promise<void> {
-  const token = await handle.tokenPromise;
+  // 解決完了を待つが、1社あたりの処理時間 (3分) を食い潰さないよう上限を設ける。
+  // 上限超過時はトークン無しで送信を試みる (CAPTCHA 必須サイトはどのみち失敗するが、
+  // CAPTCHA 検出が誤判定だったページを無駄に何十秒もブロックしないため)。
+  const token = await Promise.race([
+    handle.tokenPromise,
+    new Promise<string>((resolve) => setTimeout(() => resolve(""), maxWaitMs)),
+  ]);
   if (!token) return;
   await injectToken(page, handle.info, token);
 }

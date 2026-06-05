@@ -79,6 +79,7 @@ export async function processDeliveryJob(
     include: {
       list: { include: { companies: true } },
       messageTemplate: true,
+      fallbackMessageTemplate: true,
       senderTemplate: true,
       // screenshot (PNG bytes) は不要かつ重いので除外
       results: { omit: { screenshot: true } },
@@ -203,20 +204,25 @@ export async function processDeliveryJob(
       result: Awaited<ReturnType<typeof submitForm>>;
     };
 
-    const attemptLoop = async (): Promise<Outcome> => {
+    // 指定の入力 (本文) で最大 maxAttempts 回まで送信を試みる。
+    const attemptLoop = async (
+      attemptInput: FormInput,
+      maxAttempts: number,
+      labelSuffix: string,
+    ): Promise<Outcome> => {
       let attempts = 0;
       let last: Awaited<ReturnType<typeof submitForm>> = {
         status: "failed",
         errorType: "UNKNOWN",
         errorMessage: "未実行",
       };
-      for (let i = 0; i < MAX_ATTEMPTS; i++) {
+      for (let i = 0; i < maxAttempts; i++) {
         attempts++;
         const screenshotPath = screenshotDir
-          ? join(screenshotDir, `${sanitizeName(company.name)}_attempt${i + 1}.png`)
+          ? join(screenshotDir, `${sanitizeName(company.name)}_${labelSuffix}${i + 1}.png`)
           : undefined;
         try {
-          last = await submitForm(company.formUrl, input, { screenshotPath });
+          last = await submitForm(company.formUrl, attemptInput, { screenshotPath });
           if (last.status === "success") break;
         } catch (e) {
           last = {
@@ -227,6 +233,32 @@ export async function processDeliveryJob(
         }
       }
       return { attempts, result: last };
+    };
+
+    // 本文を変えても解消し得ない構造的失敗 (フォーム無し/項目不一致/HTTPエラー) は
+    // フォールバック再送をスキップする。バリデーション/不明/送信失敗のときだけ短文で再送。
+    const FALLBACK_RETRYABLE = new Set(["VALIDATION_ERROR", "UNKNOWN", "SUBMIT_FAILED"]);
+
+    // 本文(本命)→失敗かつ短文フォールバックありなら短文で再送、までを1つの per-company
+    // タイムアウト内で実行する。
+    const runAll = async (): Promise<Outcome> => {
+      const main = await attemptLoop(input, MAX_ATTEMPTS, "attempt");
+      if (main.result.status === "success") return main;
+
+      const fb = job.fallbackMessageTemplate;
+      if (!fb || !FALLBACK_RETRYABLE.has(main.result.errorType ?? "")) return main;
+
+      const fbInput: FormInput = {
+        ...input,
+        subject: applyVars(fb.subject, company.name),
+        message: applyVars(fb.body, company.name),
+      };
+      const fallback = await attemptLoop(fbInput, MAX_ATTEMPTS, "fallback");
+      const attempts = main.attempts + fallback.attempts;
+      if (fallback.result.status === "success") return { attempts, result: fallback.result };
+      // 両方失敗: スクリーンショットがある方 (より後段まで進んだ方) を残す
+      const result = fallback.result.screenshot ? fallback.result : main.result;
+      return { attempts, result };
     };
 
     const timeoutPromise = new Promise<Outcome>((resolve) =>
@@ -245,7 +277,7 @@ export async function processDeliveryJob(
     );
 
     const { attempts: attemptsUsed, result: finalResult } = await Promise.race([
-      attemptLoop(),
+      runAll(),
       timeoutPromise,
     ]);
 

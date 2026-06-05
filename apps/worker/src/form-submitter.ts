@@ -1137,6 +1137,65 @@ async function findFinalSubmitButton(
   return null;
 }
 
+// ページの状態シグネチャ (URL + 本文長)。確認画面の遷移検知・空ループ防止に使う。
+async function pageSignature(page: Page): Promise<string> {
+  const url = page.url();
+  const len = (await page.content().catch(() => "")).length;
+  return `${url}::${len}`;
+}
+
+// 確認/最終送信ボタンの出現を timeoutMs まで待つ。遅延表示や意図的な遅延に対応するため
+// ポーリングする。可視な要素のみ返す。
+async function waitForConfirmationButton(
+  page: Page,
+  timeoutMs: number,
+): Promise<ElementHandle<Element> | null> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const btn =
+      (await findConfirmationSendButton(page)) ?? (await findFinalSubmitButton(page));
+    if (btn) {
+      const visible = await btn.isVisible().catch(() => false);
+      if (visible) return btn;
+    }
+    if (Date.now() >= deadline) return null;
+    await page.waitForTimeout(500);
+  }
+}
+
+// 1段目の送信後、確認/検証ページに現れる「2つ目の送信ボタン」を出現待ち→クリックで
+// 連鎖処理する。多段階の確認 (内容確認→送信完了) や、ボタンが遅延表示されるケースに対応。
+// ご要望どおり、2つ目以降のボタンを押した「その時点」でスクリーンショットを撮る。
+// 戻り値: 最後にクリックした時刻 (0 = 一度も確認ボタンを押していない)。
+async function clickConfirmationChain(
+  page: Page,
+  options: { screenshotPath?: string } | undefined,
+): Promise<{ lastClickAt: number }> {
+  let lastClickAt = 0;
+  let prevSig = await pageSignature(page);
+  for (let round = 0; round < 4; round++) {
+    // 既に成功と判定できる画面に到達していれば確認段階は完了
+    const content = await page.content().catch(() => "");
+    if (isSuccessContent(content) || looksLikeSuccessUrl(page.url())) break;
+
+    const btn = await waitForConfirmationButton(page, 6_000);
+    if (!btn) break;
+
+    await clickWithFallback(btn, page);
+    lastClickAt = Date.now();
+    await waitForFormResponse(page);
+
+    // 2つ目の送信ボタンを押した時点のスクリーンショットを撮影 (ファイル保存も含む)
+    await takeShot(page, options);
+
+    // 画面が変化していなければ同じボタンを押し続けている可能性が高いので打ち切る
+    const sig = await pageSignature(page);
+    if (sig === prevSig) break;
+    prevSig = sig;
+  }
+  return { lastClickAt };
+}
+
 // ============= Success / error detection =============
 // 以前は /error/i など緩いパターンで footer/メタ等の関係ない "error" 文字列に
 // 誤反応していた。下のパターンは「フォーム送信文脈っぽい日本語/英語」に絞る。
@@ -1288,13 +1347,15 @@ async function attachShot(
   return result;
 }
 
-export async function submitForm(
+// 送信本体。useProxy=false の場合はプロキシを使わず直接接続する。
+async function runSubmit(
   formUrl: string,
   input: FormInput,
-  options?: { screenshotPath?: string },
+  options: { screenshotPath?: string } | undefined,
+  useProxy: boolean,
 ): Promise<SubmitResult> {
   const browser = await getBrowser();
-  const proxyServer = process.env["PROXY_SERVER"];
+  const proxyServer = useProxy ? process.env["PROXY_SERVER"] : undefined;
   const proxyUsername = process.env["PROXY_USERNAME"];
   const proxyPassword = process.env["PROXY_PASSWORD"];
   const context = await browser.newContext({
@@ -1385,29 +1446,21 @@ export async function submitForm(
 
     const urlBefore = page.url();
     await clickWithFallback(submitBtn, page);
+    const firstClickAt = Date.now();
     await waitForFormResponse(page);
 
-    // 確認画面が出るタイプのフォーム対策:
-    // 次ページに「送信」value/text を持つ submit/name=send があれば、もう一度クリック
-    const confirmBtn = await findConfirmationSendButton(page);
-    if (confirmBtn) {
-      await clickWithFallback(confirmBtn, page);
-      await waitForFormResponse(page);
-    }
+    // 確認画面 (2段階送信) 対策:
+    // 次ページに現れる「2つ目の送信ボタン」を出現待ち→クリックで連鎖処理する。
+    // 多段階確認・遅延表示にも対応し、各クリック時点でスクリーンショットを撮る。
+    const { lastClickAt } = await clickConfirmationChain(page, options);
 
-    // 更に id/name="submit" を持ち value/text に "Send Message"/"送信" を含む要素があれば
-    // 最終確認としてもう一度クリック (3段階目)
-    const finalBtn = await findFinalSubmitButton(page);
-    if (finalBtn) {
-      await clickWithFallback(finalBtn, page);
-      await waitForFormResponse(page);
-    }
-
-    // 最終送信ボタン押下時刻を基準にタイミング制御する。
-    const submittedAt = Date.now();
+    // タイミングは「最後に押した送信ボタン」を基準にする
+    // (確認ボタンを押していなければ1段目の送信ボタン押下時刻)。
+    const submittedAt = lastClickAt || firstClickAt;
 
     // ユーザ要件: 最終送信ボタン押下から「1秒後」にスクリーンショットを撮り始める。
-    await page.waitForTimeout(1000);
+    const sinceLastClick = Date.now() - submittedAt;
+    if (sinceLastClick < 1000) await page.waitForTimeout(1000 - sinceLastClick);
     const shot = await takeShot(page, options);
 
     const urlAfter = page.url();
@@ -1464,4 +1517,30 @@ export async function submitForm(
     await page.close().catch(() => null);
     await context.close().catch(() => null);
   }
+}
+
+// 公開API。プロキシ設定がある場合はまずプロキシ経由で試し、ネットワーク/タイムアウト
+// 系の失敗 (プロキシの遅延・IPブロック等が疑われる) のときだけ直接接続で1回リトライする。
+// 直接接続で成功すればそれを採用。両方失敗ならスクリーンショットが取れている方を返す。
+export async function submitForm(
+  formUrl: string,
+  input: FormInput,
+  options?: { screenshotPath?: string },
+): Promise<SubmitResult> {
+  const proxyConfigured = !!process.env["PROXY_SERVER"];
+  const first = await runSubmit(formUrl, input, options, proxyConfigured);
+  if (!proxyConfigured) return first;
+  if (first.status === "success") return first;
+
+  // プロキシ起因が疑われる失敗のみ直接接続でリトライ
+  if (first.errorType === "NETWORK_ERROR" || first.errorType === "TIMEOUT") {
+    console.warn(
+      `[form-submitter] proxy attempt failed (${first.errorType}); retrying without proxy: ${formUrl}`,
+    );
+    const direct = await runSubmit(formUrl, input, options, false);
+    if (direct.status === "success") return direct;
+    // どちらも失敗 — スクリーンショットがある方 (より後段まで進んだ方) を優先
+    return direct.screenshot && !first.screenshot ? direct : first;
+  }
+  return first;
 }
