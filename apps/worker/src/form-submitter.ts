@@ -8,6 +8,10 @@ import {
   type FillPlan,
 } from "./ai-form-analyzer.ts";
 
+// 送信オプション。timeoutMs は1社あたりの残り処理時間 (これを超えたら現在画面を
+// 撮影して TIMEOUT を返す)。
+export type SubmitOptions = { screenshotPath?: string; timeoutMs?: number };
+
 let browserInstance: Browser | null = null;
 
 export async function getBrowser(): Promise<Browser> {
@@ -124,6 +128,17 @@ async function pickBestForm(
       'div[class*="p-contact"]',
       'div[class*="satori"]',
       'form[class*="wpcf7-form"]',
+      // id/class が form-container / form-page 系の div フォーム (ユーザ報告のパターン)
+      'div[class*="form-page"]',
+      'div[class*="form_page"]',
+      'div[class*="formPage"]',
+      'div[class*="form-container"]',
+      'div[class*="form_container"]',
+      'div[class*="formContainer"]',
+      'div[id*="form-container"]',
+      'div[id*="form_container"]',
+      'div[id*="form-page"]',
+      'div[id*="form_page"]',
       'div[id*="form"]',
       'div[id*="contact"]',
       'div[id*="inquiry"]',
@@ -1403,11 +1418,43 @@ async function attachShot(
   return result;
 }
 
+// core() の実行に「デッドライン監視」を付与する。overallMs を超えたら、その時点の
+// 画面を撮影し、どの段階で詰まったか (stageRef.s) を添えた TIMEOUT を返す。
+// これにより 1社あたりの時間切れでもスクリーンショットと原因を必ず記録できる。
+async function withDeadline(
+  page: Page,
+  options: SubmitOptions | undefined,
+  overallMs: number,
+  stageRef: { s: string },
+  core: () => Promise<SubmitResult>,
+): Promise<SubmitResult> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadlineP = new Promise<SubmitResult>((resolve) => {
+    timer = setTimeout(() => {
+      void (async () => {
+        const shot = await takeShot(page, options).catch(() => undefined);
+        const result: SubmitResult = {
+          status: "failed",
+          errorType: "TIMEOUT",
+          errorMessage: `処理時間 ${Math.round(overallMs / 1000)} 秒を超過しました（段階: ${stageRef.s}）。`,
+        };
+        if (shot) result.screenshot = shot;
+        resolve(result);
+      })();
+    }, overallMs);
+  });
+  try {
+    return await Promise.race([core(), deadlineP]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 // 送信本体。useProxy=false の場合はプロキシを使わず直接接続する。
 async function runSubmit(
   formUrl: string,
   input: FormInput,
-  options: { screenshotPath?: string } | undefined,
+  options: SubmitOptions | undefined,
   useProxy: boolean,
 ): Promise<SubmitResult> {
   const browser = await getBrowser();
@@ -1421,7 +1468,10 @@ async function runSubmit(
       : {}),
   });
   const page = await context.newPage();
-  try {
+  const overallMs = options?.timeoutMs ?? 170_000;
+  const stageRef = { s: "ナビゲーション" };
+  const core = async (): Promise<SubmitResult> => {
+   try {
     const response = await page.goto(formUrl, {
       waitUntil: "domcontentloaded",
       timeout: NAV_TIMEOUT,
@@ -1436,6 +1486,7 @@ async function runSubmit(
       });
     }
 
+    stageRef.s = "フォーム検出";
     const form = await pickBestForm(page);
     if (!form) {
       return await attachShot(page, options, {
@@ -1447,6 +1498,7 @@ async function runSubmit(
     }
 
     // キャプチャ検出 → バックグラウンドで解決開始 (フォーム充填と並行して待機)
+    stageRef.s = "項目入力";
     let captchaHandle: CaptchaSolveHandle | null = null;
     try {
       captchaHandle = await startCaptchaSolve(page);
@@ -1500,6 +1552,7 @@ async function runSubmit(
       });
     }
 
+    stageRef.s = "送信ボタン押下";
     const urlBefore = page.url();
     await clickWithFallback(submitBtn, page);
     const firstClickAt = Date.now();
@@ -1508,6 +1561,7 @@ async function runSubmit(
     // 確認画面 (2段階送信) 対策:
     // 次ページに現れる「2つ目の送信ボタン」を出現待ち→クリックで連鎖処理する。
     // 多段階確認・遅延表示にも対応し、各クリック時点でスクリーンショットを撮る。
+    stageRef.s = "確認画面・送信完了待ち";
     const { lastClickAt } = await clickConfirmationChain(page, options);
 
     // タイミングは「最後に押した送信ボタン」を基準にする
@@ -1565,14 +1619,18 @@ async function runSubmit(
     if (elapsed < 7000) await page.waitForTimeout(7000 - elapsed);
 
     return result;
-  } catch (e) {
+   } catch (e) {
     const err = e as Error;
     // 例外時 (タイムアウト/ナビゲーション失敗など) も、可能なら最終画面を残す。
     const result: SubmitResult =
       err.name === "TimeoutError"
-        ? { status: "failed", errorType: "TIMEOUT", errorMessage: err.message }
+        ? { status: "failed", errorType: "TIMEOUT", errorMessage: `${err.message}（段階: ${stageRef.s}）` }
         : { status: "failed", errorType: "UNKNOWN", errorMessage: err.message || String(e) };
     return await attachShot(page, options, result);
+   }
+  };
+  try {
+    return await withDeadline(page, options, overallMs, stageRef, core);
   } finally {
     await page.close().catch(() => null);
     await context.close().catch(() => null);
@@ -1585,19 +1643,24 @@ async function runSubmit(
 export async function submitForm(
   formUrl: string,
   input: FormInput,
-  options?: { screenshotPath?: string },
+  options?: SubmitOptions,
 ): Promise<SubmitResult> {
   const proxyConfigured = !!process.env["PROXY_SERVER"];
-  const first = await runSubmit(formUrl, input, options, proxyConfigured);
+  const overallMs = options?.timeoutMs ?? 170_000;
+  const deadline = Date.now() + overallMs;
+
+  const first = await runSubmit(formUrl, input, { ...options, timeoutMs: overallMs }, proxyConfigured);
   if (!proxyConfigured) return first;
   if (first.status === "success") return first;
 
-  // プロキシ起因が疑われる失敗のみ直接接続でリトライ
+  // プロキシ起因が疑われる失敗のみ直接接続でリトライ (残り時間内で)
   if (first.errorType === "NETWORK_ERROR" || first.errorType === "TIMEOUT") {
+    const remaining = deadline - Date.now();
+    if (remaining < 8_000) return first;
     console.warn(
       `[form-submitter] proxy attempt failed (${first.errorType}); retrying without proxy: ${formUrl}`,
     );
-    const direct = await runSubmit(formUrl, input, options, false);
+    const direct = await runSubmit(formUrl, input, { ...options, timeoutMs: remaining }, false);
     if (direct.status === "success") return direct;
     // どちらも失敗 — スクリーンショットがある方 (より後段まで進んだ方) を優先
     return direct.screenshot && !first.screenshot ? direct : first;
@@ -1727,12 +1790,13 @@ async function executeFillPlan(page: Page, plan: FillPlan): Promise<void> {
   }
 }
 
-// AI 解析で送信を試みる本体 (最後の手段)。
+// AI 解析で送信を試みる本体 (最後の手段)。cachedPlan があれば Claude を呼ばず再利用する。
 async function runSubmitAI(
   formUrl: string,
   input: FormInput,
-  options: { screenshotPath?: string } | undefined,
+  options: SubmitOptions | undefined,
   useProxy: boolean,
+  cachedPlan?: FillPlan,
 ): Promise<SubmitResult> {
   const browser = await getBrowser();
   const proxyServer = useProxy ? process.env["PROXY_SERVER"] : undefined;
@@ -1749,7 +1813,10 @@ async function runSubmitAI(
       : {}),
   });
   const page = await context.newPage();
-  try {
+  const overallMs = options?.timeoutMs ?? 170_000;
+  const stageRef = { s: "AI: ナビゲーション" };
+  const core = async (): Promise<SubmitResult> => {
+   try {
     const response = await page.goto(formUrl, {
       waitUntil: "domcontentloaded",
       timeout: NAV_TIMEOUT,
@@ -1765,6 +1832,7 @@ async function runSubmitAI(
     }
 
     // キャプチャはバックグラウンドで解決開始
+    stageRef.s = "AI: フォーム解析";
     let captchaHandle: CaptchaSolveHandle | null = null;
     try {
       captchaHandle = await startCaptchaSolve(page);
@@ -1772,15 +1840,20 @@ async function runSubmitAI(
       /* 続行 */
     }
 
-    const snapshot = await extractFormSnapshot(page);
-    const preShot = await takeShot(page, undefined); // 視覚解析用 (ファイル保存しない)
-    const plan = await generateFillPlan({
-      url: page.url(),
-      fields: snapshot.fields,
-      buttons: snapshot.buttons,
-      values: inputToFillValues(input),
-      screenshotPng: preShot,
-    });
+    // 学習済みレシピがあればそれを使い (Claude 呼び出しをスキップ)、無ければ解析する。
+    stageRef.s = "AI: 項目入力";
+    let plan: FillPlan | null = cachedPlan ?? null;
+    if (!plan) {
+      const snapshot = await extractFormSnapshot(page);
+      const preShot = await takeShot(page, undefined); // 視覚解析用 (ファイル保存しない)
+      plan = await generateFillPlan({
+        url: page.url(),
+        fields: snapshot.fields,
+        buttons: snapshot.buttons,
+        values: inputToFillValues(input),
+        screenshotPng: preShot,
+      });
+    }
 
     if (!plan || plan.fills.length === 0) {
       return await attachShot(page, options, {
@@ -1790,8 +1863,11 @@ async function runSubmitAI(
         httpStatus,
       });
     }
+    const usedPlan: FillPlan = plan;
 
-    await executeFillPlan(page, plan);
+    await executeFillPlan(page, usedPlan);
+
+    stageRef.s = "AI: 送信";
 
     if (captchaHandle) {
       try {
@@ -1839,7 +1915,7 @@ async function runSubmitAI(
     await logInvalidFields(page);
 
     let result: SubmitResult;
-    const planSuccessHit = plan.successText.length >= 2 && content.includes(plan.successText);
+    const planSuccessHit = usedPlan.successText.length >= 2 && content.includes(usedPlan.successText);
     if (planSuccessHit || isSuccessContent(content)) {
       result = { status: "success", httpStatus };
     } else if (isErrorContent(content) || (await hasVisibleErrorElement(page))) {
@@ -1863,18 +1939,24 @@ async function runSubmitAI(
       };
     }
     if (shot) result.screenshot = shot;
+    // 学習用: 実行したプランを結果に添付 (成功時に job-processor がレシピ保存する)
+    result.recipe = usedPlan;
 
     const elapsed = Date.now() - submittedAt;
     if (elapsed < 7000) await page.waitForTimeout(7000 - elapsed);
     return result;
-  } catch (e) {
+   } catch (e) {
     const err = e as Error;
     console.warn("[runSubmitAI] error:", err.message ?? String(e));
     const result: SubmitResult =
       err.name === "TimeoutError"
-        ? { status: "failed", errorType: "TIMEOUT", errorMessage: err.message }
+        ? { status: "failed", errorType: "TIMEOUT", errorMessage: `${err.message}（段階: ${stageRef.s}）` }
         : { status: "failed", errorType: "UNKNOWN", errorMessage: err.message || String(e) };
     return await attachShot(page, options, result);
+   }
+  };
+  try {
+    return await withDeadline(page, options, overallMs, stageRef, core);
   } finally {
     await page.close().catch(() => null);
     await context.close().catch(() => null);
@@ -1886,10 +1968,11 @@ async function runSubmitAI(
 export async function submitFormWithAI(
   formUrl: string,
   input: FormInput,
-  options?: { screenshotPath?: string },
+  options?: SubmitOptions,
+  cachedPlan?: FillPlan,
 ): Promise<SubmitResult> {
   const proxyConfigured = !!process.env["PROXY_SERVER"];
-  return await runSubmitAI(formUrl, input, options, proxyConfigured);
+  return await runSubmitAI(formUrl, input, options, proxyConfigured, cachedPlan);
 }
 
 // AI 解析機能が利用可能か (APIキーの有無)。

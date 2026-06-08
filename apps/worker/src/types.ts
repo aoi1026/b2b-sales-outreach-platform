@@ -31,6 +31,8 @@ export type SubmitResult = {
   httpStatus?: number;
   // 送信完了時の全画面スクリーンショット (PNG)。撮影が有効な場合のみ。
   screenshot?: Buffer;
+  // AI 解析で実行した送信プラン (フェーズC: 成功時にドメイン別レシピとして学習保存する)。
+  recipe?: import("./ai-form-analyzer.ts").FillPlan;
 };
 
 export type DeliveryJobPayload = {

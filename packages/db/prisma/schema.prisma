@@ -186,6 +186,23 @@ model CaseList {
   @@map("case_lists")
 }
 
+// フェーズC: AIが学習したフォーム送信レシピ (ドメイン単位)。
+// AI送信が成功したプランを保存し、次回以降は再利用する (成功/失敗で強化・淘汰)。
+model FormRecipe {
+  id           String    @id @default(cuid())
+  domain       String    @unique
+  plan         Json
+  successCount Int       @default(0) @map("success_count")
+  failCount    Int       @default(0) @map("fail_count")
+  enabled      Boolean   @default(true)
+  lastUsedAt   DateTime? @map("last_used_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  @@index([enabled])
+  @@map("form_recipes")
+}
+
 model Setting {
   key       String   @id
   value     String   @db.Text

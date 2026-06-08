@@ -6,6 +6,7 @@ import {
   submitFormWithAI,
   isAIFormAnalyzerEnabled,
 } from "./form-submitter.ts";
+import type { FillPlan } from "./ai-form-analyzer.ts";
 import type { DeliveryJobPayload, FormInput } from "./types.ts";
 
 const prisma = new PrismaClient();
@@ -14,9 +15,69 @@ const INTER_COMPANY_DELAY_MS = 2000;
 const MAX_ATTEMPTS = 3;
 // 1社あたりの全リトライ含む最大処理時間。これを超えると TIMEOUT 扱いで次社へ。
 const PER_COMPANY_TIMEOUT_MS = 180_000;
+// レシピがこの回数連続的に失敗したら無効化し、次回は Claude で作り直す。
+const RECIPE_FAIL_DISABLE_THRESHOLD = 3;
 
 function sanitizeName(name: string): string {
   return name.replace(/[\\/:*?"<>|]/g, "_").slice(0, 80);
+}
+
+// ============= フェーズC: 学習レシピ (FormRecipe) =============
+
+function domainOf(url: string): string | null {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+// 有効かつ失敗閾値未満の学習済みレシピを返す。無ければ null。
+async function loadRecipe(domain: string): Promise<FillPlan | null> {
+  try {
+    const r = await prisma.formRecipe.findUnique({ where: { domain } });
+    if (!r || !r.enabled) return null;
+    if (r.failCount >= RECIPE_FAIL_DISABLE_THRESHOLD) return null;
+    const plan = r.plan as unknown as FillPlan;
+    if (!plan || !Array.isArray(plan.fills)) return null;
+    await prisma.formRecipe
+      .update({ where: { domain }, data: { lastUsedAt: new Date() } })
+      .catch(() => null);
+    return plan;
+  } catch (e) {
+    console.warn(`[worker] loadRecipe(${domain}) failed:`, (e as Error).message);
+    return null;
+  }
+}
+
+// AI送信の成否でレシピを強化/淘汰する。成功時は plan を保存し失敗カウントをリセット、
+// 失敗時は失敗カウントを増やし、閾値到達で無効化 (次回 Claude が作り直す)。
+async function recordRecipeOutcome(
+  domain: string,
+  success: boolean,
+  plan?: FillPlan,
+): Promise<void> {
+  try {
+    if (success && plan) {
+      await prisma.formRecipe.upsert({
+        where: { domain },
+        create: { domain, plan: plan as unknown as object, successCount: 1, enabled: true, lastUsedAt: new Date() },
+        update: { plan: plan as unknown as object, successCount: { increment: 1 }, failCount: 0, enabled: true, lastUsedAt: new Date() },
+      });
+      return;
+    }
+    if (!success) {
+      const r = await prisma.formRecipe.findUnique({ where: { domain } });
+      if (!r) return;
+      const nextFail = r.failCount + 1;
+      await prisma.formRecipe.update({
+        where: { domain },
+        data: { failCount: nextFail, enabled: nextFail < RECIPE_FAIL_DISABLE_THRESHOLD },
+      });
+    }
+  } catch (e) {
+    console.warn(`[worker] recordRecipeOutcome(${domain}) failed:`, (e as Error).message);
+  }
 }
 
 function applyVars(text: string, companyName: string): string {
@@ -201,11 +262,15 @@ export async function processDeliveryJob(
     });
 
     // 1社あたり最大 PER_COMPANY_TIMEOUT_MS (3分) のハードキャップ。
-    // リトライ全体を一つの Promise として race し、タイムアウトしたら TIMEOUT で次社へ。
+    // 各 submitForm 呼び出しに「残り時間」を渡し、超過時は最終画面を撮影した TIMEOUT を
+    // 返させる (外側で race して結果を捨てると スクリーンショットが残らないため)。
     type Outcome = {
       attempts: number;
       result: Awaited<ReturnType<typeof submitForm>>;
     };
+    const companyDeadline = Date.now() + PER_COMPANY_TIMEOUT_MS;
+    const remainingMs = () => Math.max(8_000, companyDeadline - Date.now());
+    const outOfTime = () => Date.now() >= companyDeadline;
 
     // 指定の入力 (本文) で最大 maxAttempts 回まで送信を試みる。
     const attemptLoop = async (
@@ -220,12 +285,16 @@ export async function processDeliveryJob(
         errorMessage: "未実行",
       };
       for (let i = 0; i < maxAttempts; i++) {
+        if (outOfTime()) break;
         attempts++;
         const screenshotPath = screenshotDir
           ? join(screenshotDir, `${sanitizeName(company.name)}_${labelSuffix}${i + 1}.png`)
           : undefined;
         try {
-          last = await submitForm(company.formUrl, attemptInput, { screenshotPath });
+          last = await submitForm(company.formUrl, attemptInput, {
+            screenshotPath,
+            timeoutMs: remainingMs(),
+          });
           if (last.status === "success") break;
         } catch (e) {
           last = {
@@ -250,8 +319,15 @@ export async function processDeliveryJob(
       "FIELD_MISMATCH",
     ]);
 
+    const aiOpts = () => ({
+      screenshotPath: screenshotDir
+        ? join(screenshotDir, `${sanitizeName(company.name)}_ai.png`)
+        : undefined,
+      timeoutMs: remainingMs(),
+    });
+
     // 本文(本命)→失敗かつ短文フォールバックありなら短文で再送→なお失敗なら
-    // AI 解析で再送、までを1つの per-company タイムアウト内で実行する。
+    // AI 解析で再送 (学習済みレシピがあれば再利用)、までを per-company 時間内で実行する。
     const runAll = async (): Promise<Outcome> => {
       const main = await attemptLoop(input, MAX_ATTEMPTS, "attempt");
       if (main.result.status === "success") return main;
@@ -261,7 +337,7 @@ export async function processDeliveryJob(
 
       // 1) 短文フォールバック
       const fb = job.fallbackMessageTemplate;
-      if (fb && FALLBACK_RETRYABLE.has(main.result.errorType ?? "")) {
+      if (fb && !outOfTime() && FALLBACK_RETRYABLE.has(main.result.errorType ?? "")) {
         const fbInput: FormInput = {
           ...input,
           subject: applyVars(fb.subject, company.name),
@@ -273,47 +349,47 @@ export async function processDeliveryJob(
         if (fallback.result.screenshot && !best.result.screenshot) best = fallback;
       }
 
-      // 2) AI フォーム解析による再送 (最後の手段)。本文を変えても解消しない
-      //    構造的失敗 (フォーム未検出・項目不一致・検証/送信失敗) に有効。
-      if (
-        isAIFormAnalyzerEnabled() &&
-        AI_RETRYABLE.has(best.result.errorType ?? "")
-      ) {
-        const screenshotPath = screenshotDir
-          ? join(screenshotDir, `${sanitizeName(company.name)}_ai.png`)
-          : undefined;
-        try {
-          const ai = await submitFormWithAI(company.formUrl, input, { screenshotPath });
-          attempts += 1;
-          if (ai.status === "success") return { attempts, result: ai };
-          if (ai.screenshot && !best.result.screenshot) best = { attempts, result: ai };
-        } catch (e) {
-          console.warn(`[worker] AI submit failed for ${company.name}:`, (e as Error).message);
+      // 2) AI フォーム解析による再送 (フェーズC: 学習済みレシピを優先再利用)。
+      if (isAIFormAnalyzerEnabled() && AI_RETRYABLE.has(best.result.errorType ?? "")) {
+        const domain = domainOf(company.formUrl);
+        const recipe = domain ? await loadRecipe(domain) : null;
+
+        // (a) 学習済みレシピがあれば Claude を呼ばず再利用
+        if (recipe && !outOfTime()) {
+          try {
+            const ai = await submitFormWithAI(company.formUrl, input, aiOpts(), recipe);
+            attempts += 1;
+            if (ai.status === "success") {
+              if (domain) await recordRecipeOutcome(domain, true, ai.recipe ?? recipe);
+              return { attempts, result: ai };
+            }
+            if (domain) await recordRecipeOutcome(domain, false);
+            if (ai.screenshot && !best.result.screenshot) best = { attempts, result: ai };
+          } catch (e) {
+            console.warn(`[worker] AI(recipe) failed for ${company.name}:`, (e as Error).message);
+          }
+        }
+
+        // (b) レシピ無し or レシピ失敗 → Claude で新規生成し、成功すれば学習保存
+        if (!outOfTime()) {
+          try {
+            const ai = await submitFormWithAI(company.formUrl, input, aiOpts());
+            attempts += 1;
+            if (ai.status === "success") {
+              if (domain && ai.recipe) await recordRecipeOutcome(domain, true, ai.recipe);
+              return { attempts, result: ai };
+            }
+            if (ai.screenshot && !best.result.screenshot) best = { attempts, result: ai };
+          } catch (e) {
+            console.warn(`[worker] AI(fresh) failed for ${company.name}:`, (e as Error).message);
+          }
         }
       }
 
       return { attempts, result: best.result };
     };
 
-    const timeoutPromise = new Promise<Outcome>((resolve) =>
-      setTimeout(
-        () =>
-          resolve({
-            attempts: 0,
-            result: {
-              status: "failed",
-              errorType: "TIMEOUT",
-              errorMessage: `1社あたりの最大処理時間 (${PER_COMPANY_TIMEOUT_MS / 1000}秒) を超過しました。`,
-            },
-          }),
-        PER_COMPANY_TIMEOUT_MS,
-      ),
-    );
-
-    const { attempts: attemptsUsed, result: finalResult } = await Promise.race([
-      runAll(),
-      timeoutPromise,
-    ]);
+    const { attempts: attemptsUsed, result: finalResult } = await runAll();
 
     if (finalResult?.status === "success") {
       successCount++;

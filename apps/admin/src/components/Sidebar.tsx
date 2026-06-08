@@ -103,6 +103,7 @@ const groups: Group[] = [
       { href: "/send/log", label: "自動送信ログ", icon: Icons.log },
       { href: "/templates/message", label: "送信文章テンプレート", icon: Icons.docText },
       { href: "/templates/sender", label: "送信元テンプレート", icon: Icons.user },
+      { href: "/recipes", label: "学習レシピ (AI)", icon: Icons.list },
       { href: "/exclusions", label: "送信除外設定", icon: Icons.block },
     ],
   },
