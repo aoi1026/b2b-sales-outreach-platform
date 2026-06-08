@@ -1,7 +1,11 @@
 import { mkdirSync } from "fs";
 import { join } from "path";
 import pkg from "../../../packages/db/generated/prisma/index.js";
-import { submitForm } from "./form-submitter.ts";
+import {
+  submitForm,
+  submitFormWithAI,
+  isAIFormAnalyzerEnabled,
+} from "./form-submitter.ts";
 import type { DeliveryJobPayload, FormInput } from "./types.ts";
 
 const { PrismaClient } = pkg;
@@ -238,27 +242,58 @@ export async function processDeliveryJob(
     // 本文を変えても解消し得ない構造的失敗 (フォーム無し/項目不一致/HTTPエラー) は
     // フォールバック再送をスキップする。バリデーション/不明/送信失敗のときだけ短文で再送。
     const FALLBACK_RETRYABLE = new Set(["VALIDATION_ERROR", "UNKNOWN", "SUBMIT_FAILED"]);
+    // AI 解析はフォーム構造そのものの取りこぼしにも効くため、対象を少し広げる。
+    const AI_RETRYABLE = new Set([
+      "VALIDATION_ERROR",
+      "UNKNOWN",
+      "SUBMIT_FAILED",
+      "FORM_NOT_FOUND",
+      "FIELD_MISMATCH",
+    ]);
 
-    // 本文(本命)→失敗かつ短文フォールバックありなら短文で再送、までを1つの per-company
-    // タイムアウト内で実行する。
+    // 本文(本命)→失敗かつ短文フォールバックありなら短文で再送→なお失敗なら
+    // AI 解析で再送、までを1つの per-company タイムアウト内で実行する。
     const runAll = async (): Promise<Outcome> => {
       const main = await attemptLoop(input, MAX_ATTEMPTS, "attempt");
       if (main.result.status === "success") return main;
 
-      const fb = job.fallbackMessageTemplate;
-      if (!fb || !FALLBACK_RETRYABLE.has(main.result.errorType ?? "")) return main;
+      let best = main;
+      let attempts = main.attempts;
 
-      const fbInput: FormInput = {
-        ...input,
-        subject: applyVars(fb.subject, company.name),
-        message: applyVars(fb.body, company.name),
-      };
-      const fallback = await attemptLoop(fbInput, MAX_ATTEMPTS, "fallback");
-      const attempts = main.attempts + fallback.attempts;
-      if (fallback.result.status === "success") return { attempts, result: fallback.result };
-      // 両方失敗: スクリーンショットがある方 (より後段まで進んだ方) を残す
-      const result = fallback.result.screenshot ? fallback.result : main.result;
-      return { attempts, result };
+      // 1) 短文フォールバック
+      const fb = job.fallbackMessageTemplate;
+      if (fb && FALLBACK_RETRYABLE.has(main.result.errorType ?? "")) {
+        const fbInput: FormInput = {
+          ...input,
+          subject: applyVars(fb.subject, company.name),
+          message: applyVars(fb.body, company.name),
+        };
+        const fallback = await attemptLoop(fbInput, MAX_ATTEMPTS, "fallback");
+        attempts += fallback.attempts;
+        if (fallback.result.status === "success") return { attempts, result: fallback.result };
+        if (fallback.result.screenshot && !best.result.screenshot) best = fallback;
+      }
+
+      // 2) AI フォーム解析による再送 (最後の手段)。本文を変えても解消しない
+      //    構造的失敗 (フォーム未検出・項目不一致・検証/送信失敗) に有効。
+      if (
+        isAIFormAnalyzerEnabled() &&
+        AI_RETRYABLE.has(best.result.errorType ?? "")
+      ) {
+        const screenshotPath = screenshotDir
+          ? join(screenshotDir, `${sanitizeName(company.name)}_ai.png`)
+          : undefined;
+        try {
+          const ai = await submitFormWithAI(company.formUrl, input, { screenshotPath });
+          attempts += 1;
+          if (ai.status === "success") return { attempts, result: ai };
+          if (ai.screenshot && !best.result.screenshot) best = { attempts, result: ai };
+        } catch (e) {
+          console.warn(`[worker] AI submit failed for ${company.name}:`, (e as Error).message);
+        }
+      }
+
+      return { attempts, result: best.result };
     };
 
     const timeoutPromise = new Promise<Outcome>((resolve) =>

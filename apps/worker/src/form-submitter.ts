@@ -1,6 +1,12 @@
 import { chromium, type Browser, type Page, type ElementHandle } from "playwright";
 import type { FormInput, SubmitResult } from "./types.ts";
 import { startCaptchaSolve, injectCaptchaToken, type CaptchaSolveHandle } from "./captcha-solver.ts";
+import {
+  generateFillPlan,
+  type FieldDescriptor,
+  type ButtonDescriptor,
+  type FillPlan,
+} from "./ai-form-analyzer.ts";
 
 let browserInstance: Browser | null = null;
 
@@ -161,6 +167,10 @@ async function getElementMeta(page: Page, el: ElementHandle<Element>) {
   const placeholder = (await el.getAttribute("placeholder")) ?? "";
   const type = ((await el.getAttribute("type")) ?? "").toLowerCase();
   const required = (await el.getAttribute("required")) !== null;
+  // autocomplete (Web標準) と data-column (Typeform/独自フォームの項目ラベル) も
+  // 項目判定のヒントに使う。n-kokudo は autocomplete、mitsuuroko は data-column 依存。
+  const autocomplete = ((await el.getAttribute("autocomplete")) ?? "").toLowerCase();
+  const dataColumn = (await el.getAttribute("data-column")) ?? "";
   const tagName = (await el.evaluate((n) => n.tagName.toLowerCase())) as string;
 
   let labelText = "";
@@ -185,9 +195,11 @@ async function getElementMeta(page: Page, el: ElementHandle<Element>) {
     required,
     tagName,
     labelText,
+    autocomplete,
+    dataColumn,
     idLower: id.toLowerCase(),
     nameLower: name.toLowerCase(),
-    combined: [name, id, placeholder, labelText, type].join("|").toLowerCase(),
+    combined: [name, id, placeholder, labelText, dataColumn, type].join("|").toLowerCase(),
   };
 }
 
@@ -196,11 +208,42 @@ type ElementMeta = Awaited<ReturnType<typeof getElementMeta>>;
 // ============= Field role detection =============
 
 function detectFieldRole(meta: ElementMeta): FieldRole {
-  const { tagName, type, idLower, nameLower, combined } = meta;
+  const { tagName, type, idLower, nameLower, combined, autocomplete } = meta;
   const idOrName = `${idLower}|${nameLower}`;
 
   // <textarea> 要素は常に本文
   if (tagName === "textarea") return "message";
+
+  // ====== autocomplete (Web標準トークン) による判定 — name/id より信頼度が高い ======
+  // n-kokudo のように autocomplete="name/tel/email/postal-code/address-level1/2" で
+  // 項目を表すフォームに対応。これらは標準値なので最優先で確定させる。
+  switch (autocomplete) {
+    case "name":
+      return "person";
+    case "family-name":
+      return "person_last";
+    case "given-name":
+      return "person_first";
+    case "organization":
+      return "company";
+    case "email":
+      return "email";
+    case "tel":
+    case "tel-national":
+      return "phone";
+    case "postal-code":
+      return "postal_code";
+    case "address-level1": // 都道府県
+    case "address-level2": // 市区町村
+    case "street-address":
+    case "address-line1":
+    case "address-line2":
+      return "address";
+    case "url":
+      return "url";
+    default:
+      break;
+  }
 
   // type 属性によるハードな決定 (最優先)
   if (type === "email") {
@@ -1114,6 +1157,13 @@ async function findConfirmationSendButton(
 async function findFinalSubmitButton(
   page: Page,
 ): Promise<ElementHandle<Element> | null> {
+  // Typeform 等の data-tf-type="confirm"/"submit" は明示的な意図なので最優先で採用。
+  // (確認→送信の2段。confirm を先に拾い、無ければ submit。)
+  const tfConfirm = await page.$('[data-tf-type="confirm"]');
+  if (tfConfirm) return tfConfirm;
+  const tfSubmit = await page.$('[data-tf-type="submit"]');
+  if (tfSubmit) return tfSubmit;
+
   const candidates = await page.$$(
     '[id*="submit"], [name*="submit"], [id*="send"], [name*="send"]',
   );
@@ -1202,15 +1252,21 @@ async function clickConfirmationChain(
 
 const SUCCESS_PATTERNS = [
   /送信(?:が)?完了/,
-  /送信(?:が)?(?:され|済)/,
-  /受け付け(?:ました|完了)/,
-  /(?:お問い?合わ?せ|ご連絡).*(?:ありがと|受け付け|送信)/,
-  /ありがとうございます/,
+  /送信(?:が)?(?:され|済)(?:ました)?/,
+  /送信いたしました/,
+  /受け付け(?:ました|完了|いたしました)/,
+  /受付(?:を)?完了/,
+  /(?:お問い?合わ?せ|ご連絡|ご質問).*(?:ありがと|受け付け|送信|承り)/,
+  // 「お問い合わせありがとうございました」「ご連絡ありがとうございます」等
+  /ありがとうござい(?:ます|ました)/,
+  /(?:担当(?:者|部署)|後日|後ほど|改めて).*(?:ご連絡|ご返信|返信|連絡)/,
+  /送信が正常に/,
+  /completed?\s+successfully/i,
   /thank\s*you\s*(?:for|!|\.)/i,
   /(?:has|have)\s+been\s+(?:sent|received|submitted)/i,
   /successfully\s+(?:sent|submitted|received)/i,
-  /your\s+message\s+has\s+been/i,
-  /\bsubmission\s+complete/i,
+  /your\s+(?:message|inquiry|request)\s+has\s+been/i,
+  /\bsubmission\s+(?:complete|received)/i,
 ];
 
 const ERROR_PATTERNS = [
@@ -1486,14 +1542,18 @@ async function runSubmit(
     } else if (looksLikeSuccessUrl(urlAfter)) {
       // 3) URL が thanks/complete 系に遷移していれば成功
       result = { status: "success", httpStatus };
-    } else if (urlBefore !== urlAfter) {
-      // 4) URL は変わったがエラー文言が無い → 成功と推定 (確認画面を経た送信完了など)
-      result = { status: "success", httpStatus };
     } else {
+      // 成功文言も完了URLも無い → 成功と断定しない。
+      // 以前は「URLが変わっただけ」で成功計上していたが、確認画面到達を成功と
+      // 誤判定し成功率が実態とズレていた。ここでは誤計上を避け「要目視確認」の
+      // 失敗として記録する (スクリーンショットで実際の成否を確認できる)。
+      const advanced = urlBefore !== urlAfter || lastClickAt > 0;
       result = {
         status: "failed",
         errorType: "UNKNOWN",
-        errorMessage: "送信後のページが成功と判定できませんでした。",
+        errorMessage: advanced
+          ? "送信操作は完了しましたが、完了（成功）画面を確認できませんでした。スクリーンショットで要確認です。"
+          : "送信後のページが成功と判定できませんでした。",
         httpStatus,
       };
     }
@@ -1543,4 +1603,296 @@ export async function submitForm(
     return direct.screenshot && !first.screenshot ? direct : first;
   }
   return first;
+}
+
+// ============= AI フォーム解析による送信 (フェーズB) =============
+
+function inputToFillValues(input: FormInput) {
+  return {
+    company: input.company ?? null,
+    personName: input.person ?? null,
+    personHiragana: input.personHiragana ?? null,
+    personKatakana: input.personKatakana ?? null,
+    email: input.email ?? null,
+    phone: input.phone ?? null,
+    postalCode: input.postalCode ?? null,
+    address: input.address ?? null,
+    url: input.url ?? null,
+    subject: input.subject ?? null,
+    message: input.message ?? null,
+    position: input.position ?? null,
+  };
+}
+
+// ページ上のフォーム項目・ボタンを Claude に渡せる形へ抽出する。
+async function extractFormSnapshot(
+  page: Page,
+): Promise<{ fields: FieldDescriptor[]; buttons: ButtonDescriptor[] }> {
+  return await page.evaluate(() => {
+    // 注: page.evaluate 内では名前付きの内部関数を使わない (esbuild の keepNames が
+    // __name ヘルパを挿入し、ブラウザ側で ReferenceError になるため)。ラベル算出は
+    // 各要素ごとにインラインで行う。
+    const fields: FieldDescriptor[] = [];
+    for (const el of Array.from(document.querySelectorAll("input, select, textarea"))) {
+      const tag = el.tagName.toLowerCase();
+      const type = (
+        el.getAttribute("type") ?? (tag === "select" ? "select-one" : "text")
+      ).toLowerCase();
+      if (tag === "input" && ["hidden", "submit", "button", "image", "reset"].includes(type))
+        continue;
+
+      // ラベル算出 (label[for] → 親 label → 祖先の data-column)
+      let label = "";
+      const idAttr = el.getAttribute("id");
+      if (idAttr) {
+        const l = document.querySelector(`label[for="${CSS.escape(idAttr)}"]`);
+        if (l?.textContent) label = l.textContent.trim();
+      }
+      if (!label) {
+        const wrap = el.closest("label");
+        if (wrap?.textContent) label = wrap.textContent.trim();
+      }
+      if (!label) {
+        const col = el.closest("[data-column]");
+        if (col?.getAttribute("data-column")) label = col.getAttribute("data-column") ?? "";
+      }
+
+      let options: { value: string; text: string }[] | undefined;
+      if (tag === "select") {
+        options = Array.from(el.querySelectorAll("option")).map((o) => ({
+          value: (o as HTMLOptionElement).value,
+          text: (o.textContent ?? "").trim(),
+        }));
+      } else if (type === "radio" || type === "checkbox") {
+        // 各ラジオ/チェックは自身の value + ラベルを選択肢として持たせる
+        options = [{ value: (el as HTMLInputElement).value, text: label }];
+      }
+
+      fields.push({
+        tag,
+        type,
+        name: el.getAttribute("name") ?? "",
+        id: el.getAttribute("id") ?? "",
+        placeholder: el.getAttribute("placeholder") ?? "",
+        label: label.slice(0, 120),
+        autocomplete: (el.getAttribute("autocomplete") ?? "").toLowerCase(),
+        dataColumn: el.closest("[data-column]")?.getAttribute("data-column") ?? "",
+        required: el.hasAttribute("required"),
+        ...(options ? { options } : {}),
+      });
+    }
+
+    const buttons: ButtonDescriptor[] = [];
+    const btnSel =
+      'button, input[type="submit"], input[type="button"], [role="button"], a[class*="btn"], [data-tf-type]';
+    for (const el of Array.from(document.querySelectorAll(btnSel))) {
+      buttons.push({
+        tag: el.tagName.toLowerCase(),
+        type: (el.getAttribute("type") ?? "").toLowerCase(),
+        name: el.getAttribute("name") ?? "",
+        id: el.getAttribute("id") ?? "",
+        text: (el.textContent ?? "").trim().slice(0, 80),
+        value: el.getAttribute("value") ?? "",
+      });
+    }
+    return { fields, buttons };
+  });
+}
+
+// 生成された送信プランの fills を実行する。各項目の失敗は握り潰して次へ進む。
+async function executeFillPlan(page: Page, plan: FillPlan): Promise<void> {
+  for (const a of plan.fills) {
+    try {
+      const loc = page.locator(a.selector).first();
+      if (a.action === "fill") {
+        await loc.fill(a.value, { timeout: 5_000 });
+      } else if (a.action === "select") {
+        await loc
+          .selectOption({ label: a.value }, { timeout: 5_000 })
+          .catch(async () => {
+            await loc.selectOption(a.value, { timeout: 5_000 });
+          });
+      } else if (a.action === "check") {
+        await loc
+          .check({ timeout: 5_000 })
+          .catch(async () => {
+            await loc.click({ timeout: 5_000 });
+          });
+      } else if (a.action === "click") {
+        await loc.click({ timeout: 5_000 });
+      }
+    } catch {
+      /* この項目は埋められなかった — 次へ */
+    }
+  }
+}
+
+// AI 解析で送信を試みる本体 (最後の手段)。
+async function runSubmitAI(
+  formUrl: string,
+  input: FormInput,
+  options: { screenshotPath?: string } | undefined,
+  useProxy: boolean,
+): Promise<SubmitResult> {
+  const browser = await getBrowser();
+  const proxyServer = useProxy ? process.env["PROXY_SERVER"] : undefined;
+  const context = await browser.newContext({
+    userAgent: USER_AGENT,
+    ...(proxyServer
+      ? {
+          proxy: {
+            server: proxyServer,
+            username: process.env["PROXY_USERNAME"],
+            password: process.env["PROXY_PASSWORD"],
+          },
+        }
+      : {}),
+  });
+  const page = await context.newPage();
+  try {
+    const response = await page.goto(formUrl, {
+      waitUntil: "domcontentloaded",
+      timeout: NAV_TIMEOUT,
+    });
+    const httpStatus = response?.status() ?? 0;
+    if (httpStatus >= 400) {
+      return await attachShot(page, options, {
+        status: "failed",
+        errorType: "NETWORK_ERROR",
+        errorMessage: `HTTP ${httpStatus}`,
+        httpStatus,
+      });
+    }
+
+    // キャプチャはバックグラウンドで解決開始
+    let captchaHandle: CaptchaSolveHandle | null = null;
+    try {
+      captchaHandle = await startCaptchaSolve(page);
+    } catch {
+      /* 続行 */
+    }
+
+    const snapshot = await extractFormSnapshot(page);
+    const preShot = await takeShot(page, undefined); // 視覚解析用 (ファイル保存しない)
+    const plan = await generateFillPlan({
+      url: page.url(),
+      fields: snapshot.fields,
+      buttons: snapshot.buttons,
+      values: inputToFillValues(input),
+      screenshotPng: preShot,
+    });
+
+    if (!plan || plan.fills.length === 0) {
+      return await attachShot(page, options, {
+        status: "failed",
+        errorType: "FIELD_MISMATCH",
+        errorMessage: "AI 解析で送信プランを生成できませんでした。",
+        httpStatus,
+      });
+    }
+
+    await executeFillPlan(page, plan);
+
+    if (captchaHandle) {
+      try {
+        await injectCaptchaToken(page, captchaHandle);
+      } catch {
+        /* 注入失敗は無視 */
+      }
+    }
+
+    const urlBefore = page.url();
+
+    // プランの submitSelectors を順にクリック。各押下後にスクリーンショット。
+    let lastClickAt = 0;
+    for (const sel of plan.submitSelectors) {
+      try {
+        await page.locator(sel).first().click({ timeout: 8_000 });
+        lastClickAt = Date.now();
+        await waitForFormResponse(page);
+        await takeShot(page, options);
+      } catch {
+        /* このボタンは押せなかった */
+      }
+    }
+    // プランのボタンが全滅なら汎用の送信ボタン検出にフォールバック
+    if (lastClickAt === 0) {
+      const form = await pickBestForm(page);
+      const btn = form ? await findSubmitButton(form, page) : null;
+      if (btn) {
+        await clickWithFallback(btn, page);
+        lastClickAt = Date.now();
+        await waitForFormResponse(page);
+      }
+    }
+
+    // 残りの確認画面 (2段階送信) は既存の連鎖処理に任せる
+    const { lastClickAt: chainLast } = await clickConfirmationChain(page, options);
+    const submittedAt = chainLast || lastClickAt || Date.now();
+
+    const since = Date.now() - submittedAt;
+    if (since < 1000) await page.waitForTimeout(1000 - since);
+    const shot = await takeShot(page, options);
+
+    const urlAfter = page.url();
+    const content = await page.content().catch(() => "");
+    await logInvalidFields(page);
+
+    let result: SubmitResult;
+    const planSuccessHit = plan.successText.length >= 2 && content.includes(plan.successText);
+    if (planSuccessHit || isSuccessContent(content)) {
+      result = { status: "success", httpStatus };
+    } else if (isErrorContent(content) || (await hasVisibleErrorElement(page))) {
+      result = {
+        status: "failed",
+        errorType: "VALIDATION_ERROR",
+        errorMessage: "バリデーションエラーと思われる応答を検出しました。",
+        httpStatus,
+      };
+    } else if (looksLikeSuccessUrl(urlAfter)) {
+      result = { status: "success", httpStatus };
+    } else {
+      result = {
+        status: "failed",
+        errorType: "UNKNOWN",
+        errorMessage:
+          urlBefore !== urlAfter || lastClickAt > 0
+            ? "AI 送信は実行しましたが、完了（成功）画面を確認できませんでした。スクリーンショットで要確認です。"
+            : "AI 送信後のページが成功と判定できませんでした。",
+        httpStatus,
+      };
+    }
+    if (shot) result.screenshot = shot;
+
+    const elapsed = Date.now() - submittedAt;
+    if (elapsed < 7000) await page.waitForTimeout(7000 - elapsed);
+    return result;
+  } catch (e) {
+    const err = e as Error;
+    console.warn("[runSubmitAI] error:", err.message ?? String(e));
+    const result: SubmitResult =
+      err.name === "TimeoutError"
+        ? { status: "failed", errorType: "TIMEOUT", errorMessage: err.message }
+        : { status: "failed", errorType: "UNKNOWN", errorMessage: err.message || String(e) };
+    return await attachShot(page, options, result);
+  } finally {
+    await page.close().catch(() => null);
+    await context.close().catch(() => null);
+  }
+}
+
+// 公開API: ヒューリスティック送信が失敗した社に対し、Claude による解析で再送する。
+// ANTHROPIC_API_KEY 未設定なら呼んでも null 相当 (FIELD_MISMATCH) になる。
+export async function submitFormWithAI(
+  formUrl: string,
+  input: FormInput,
+  options?: { screenshotPath?: string },
+): Promise<SubmitResult> {
+  const proxyConfigured = !!process.env["PROXY_SERVER"];
+  return await runSubmitAI(formUrl, input, options, proxyConfigured);
+}
+
+// AI 解析機能が利用可能か (APIキーの有無)。
+export function isAIFormAnalyzerEnabled(): boolean {
+  return !!process.env["ANTHROPIC_API_KEY"];
 }
