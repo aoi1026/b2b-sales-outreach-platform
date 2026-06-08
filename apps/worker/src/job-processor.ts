@@ -1,6 +1,6 @@
 import { mkdirSync } from "fs";
 import { join } from "path";
-import pkg from "../../../packages/db/generated/prisma/index.js";
+import { PrismaClient } from "../../../packages/db/generated/prisma/index.js";
 import {
   submitForm,
   submitFormWithAI,
@@ -8,7 +8,6 @@ import {
 } from "./form-submitter.ts";
 import type { DeliveryJobPayload, FormInput } from "./types.ts";
 
-const { PrismaClient } = pkg;
 const prisma = new PrismaClient();
 
 const INTER_COMPANY_DELAY_MS = 2000;
