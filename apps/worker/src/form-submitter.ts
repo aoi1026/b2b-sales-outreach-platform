@@ -186,31 +186,63 @@ async function pickBestForm(
 
 // ============= Element metadata =============
 
-async function getElementMeta(page: Page, el: ElementHandle<Element>) {
-  const name = (await el.getAttribute("name")) ?? "";
-  const id = (await el.getAttribute("id")) ?? "";
-  const placeholder = (await el.getAttribute("placeholder")) ?? "";
-  const type = ((await el.getAttribute("type")) ?? "").toLowerCase();
-  const required = (await el.getAttribute("required")) !== null;
-  // autocomplete (Web標準) と data-column (Typeform/独自フォームの項目ラベル) も
-  // 項目判定のヒントに使う。n-kokudo は autocomplete、mitsuuroko は data-column 依存。
-  const autocomplete = ((await el.getAttribute("autocomplete")) ?? "").toLowerCase();
-  const dataColumn = (await el.getAttribute("data-column")) ?? "";
-  const tagName = (await el.evaluate((n) => n.tagName.toLowerCase())) as string;
-
-  let labelText = "";
-  if (id) {
-    labelText = await page.evaluate((idVal: string) => {
-      const lbl = document.querySelector(`label[for="${CSS.escape(idVal)}"]`);
-      return lbl?.textContent ?? "";
-    }, id);
-  }
-  if (!labelText) {
-    labelText = await el.evaluate((node) => {
-      const lbl = node.closest("label");
-      return lbl?.textContent ?? "";
+async function getElementMeta(_page: Page, el: ElementHandle<Element>) {
+  // 属性とラベルを1回の evaluate でまとめて取得する。
+  // (round-trip削減 + ページ遷移で context が破棄されても1要素の失敗で全体を落とさない)
+  type RawMeta = {
+    name: string;
+    id: string;
+    placeholder: string;
+    type: string;
+    required: boolean;
+    autocomplete: string;
+    dataColumn: string;
+    tagName: string;
+    labelText: string;
+  };
+  let raw: RawMeta;
+  try {
+    raw = await el.evaluate((node): RawMeta => {
+      const e = node as HTMLElement;
+      const get = (a: string) => e.getAttribute(a) ?? "";
+      let labelText = "";
+      const idv = get("id");
+      if (idv) {
+        const l = document.querySelector(`label[for="${CSS.escape(idv)}"]`);
+        if (l?.textContent) labelText = l.textContent;
+      }
+      if (!labelText) {
+        const w = e.closest("label");
+        if (w?.textContent) labelText = w.textContent;
+      }
+      return {
+        name: get("name"),
+        id: idv,
+        placeholder: get("placeholder"),
+        type: get("type").toLowerCase(),
+        required: e.hasAttribute("required"),
+        autocomplete: get("autocomplete").toLowerCase(),
+        dataColumn: get("data-column"),
+        tagName: e.tagName.toLowerCase(),
+        labelText,
+      };
     });
+  } catch {
+    // context 破棄 (遷移) 等 — 空メタで継続
+    raw = {
+      name: "",
+      id: "",
+      placeholder: "",
+      type: "",
+      required: false,
+      autocomplete: "",
+      dataColumn: "",
+      tagName: "",
+      labelText: "",
+    };
   }
+  const { name, id, placeholder, type, required, tagName, labelText, autocomplete, dataColumn } =
+    raw;
 
   return {
     name,
@@ -1379,17 +1411,32 @@ async function hasVisibleErrorElement(page: Page): Promise<boolean> {
         ".error-message",
         ".error-msg",
         ".errorText",
+        ".wpcf7-not-valid-tip",
+        ".mw_wp_form_error",
         '[aria-invalid="true"]',
         '[role="alert"]',
       ].join(","),
-      (els) =>
-        (els as HTMLElement[]).some((el) => {
+      (els) => {
+        // 以前は「2文字以上のテキストがあれば即エラー」としていたため、送信成功なのに
+        // 残存/汎用のエラー枠を拾って VALIDATION_ERROR を誤検知していた (最多の失敗原因)。
+        // 「実際に可視」かつ「エラー文言にマッチ」する場合のみエラーとみなすよう厳格化する。
+        const ERR =
+          /(必須|入力して|ご記入|正しく|正確に|不正|誤り|エラー|無効|未入力|未選択|選択して|半角|全角|形式|文字以内|文字以上|同意(?:し|くださ|が必要)|required|invalid|enter\s|fill\s|select\s|must\s|missing|not\s+valid)/i;
+        return (els as HTMLElement[]).some((el) => {
           const style = window.getComputedStyle(el);
-          if (style.display === "none" || style.visibility === "hidden") return false;
+          if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0")
+            return false;
+          // 親が非表示などで実際に描画されていない要素は除外
+          if (el.offsetParent === null && style.position !== "fixed") return false;
+          if (el.getAttribute("aria-hidden") === "true") return false;
+          // aria-invalid="true" は「その項目が無効」という明確なマーク → 可視なら採用
+          if (el.getAttribute("aria-invalid") === "true") return true;
           const text = (el.textContent ?? "").trim();
-          // 0文字や記号だけのコンテナはエラー文言ではないとみなす
-          return text.length >= 2 && /\S/.test(text);
-        }),
+          if (text.length < 2) return false;
+          // エラー文言にマッチした場合のみエラー扱い
+          return ERR.test(text);
+        });
+      },
     );
   } catch {
     return false;
