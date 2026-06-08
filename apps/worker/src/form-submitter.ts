@@ -15,6 +15,16 @@ export type SubmitOptions = { screenshotPath?: string; timeoutMs?: number };
 let browserInstance: Browser | null = null;
 
 export async function getBrowser(): Promise<Browser> {
+  // 前回のブラウザがクラッシュ/切断していると newContext/newPage が無限待ちになりうる。
+  // 切断を検知したら破棄して作り直す。
+  if (browserInstance && !browserInstance.isConnected()) {
+    try {
+      await browserInstance.close();
+    } catch {
+      /* 既に死んでいる */
+    }
+    browserInstance = null;
+  }
   if (!browserInstance) {
     // ローカルで挙動を目視確認したい場合は WORKER_HEADED=true で起動 (ブラウザ画面が開く)。
     // 任意で WORKER_SLOWMO=300 のようにミリ秒指定すると操作の間に遅延が入って見やすい。

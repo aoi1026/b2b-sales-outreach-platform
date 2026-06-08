@@ -5,6 +5,7 @@ import {
   submitForm,
   submitFormWithAI,
   isAIFormAnalyzerEnabled,
+  closeBrowser,
 } from "./form-submitter.ts";
 import type { FillPlan } from "./ai-form-analyzer.ts";
 import type { DeliveryJobPayload, FormInput } from "./types.ts";
@@ -389,7 +390,36 @@ export async function processDeliveryJob(
       return { attempts, result: best.result };
     };
 
-    const { attempts: attemptsUsed, result: finalResult } = await runAll();
+    // 安全網: submitForm 内部のデッドラインが効かない箇所 (ブラウザのコンテキスト/ページ
+    // 生成、レシピのDB呼び出し等) でハングしても 1社で固まらないよう、runAll 全体を
+    // ハードキャップで race する。通常は内部デッドライン (スクショ付き) が先に効くため、
+    // ここが発火するのは想定外ハング時のみ。
+    const HARD_CAP_MS = PER_COMPANY_TIMEOUT_MS + 60_000;
+    const safetyTimeout = new Promise<Outcome>((resolve) =>
+      setTimeout(
+        () =>
+          resolve({
+            attempts: 0,
+            result: {
+              status: "failed",
+              errorType: "TIMEOUT",
+              errorMessage: `1社あたりの最大処理時間 (安全網 ${HARD_CAP_MS / 1000}秒) を超過しました。`,
+            },
+          }),
+        HARD_CAP_MS,
+      ),
+    );
+    const { attempts: attemptsUsed, result: finalResult } = await Promise.race([
+      runAll(),
+      safetyTimeout,
+    ]);
+
+    // 安全網が発火した = ブラウザ生成やDB等で想定外ハングが起きた可能性が高い。
+    // 次の社に持ち越さないようブラウザを作り直す。
+    if (finalResult.errorType === "TIMEOUT" && finalResult.errorMessage?.includes("安全網")) {
+      console.warn(`[worker] safety timeout for ${company.name}; recycling browser`);
+      await closeBrowser().catch(() => null);
+    }
 
     if (finalResult?.status === "success") {
       successCount++;
