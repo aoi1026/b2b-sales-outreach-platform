@@ -1418,6 +1418,23 @@ async function attachShot(
   return result;
 }
 
+// 送信中の例外を errorType に分類する。接続拒否・名前解決失敗・プロキシ系は
+// NETWORK_ERROR にして、submitForm 側のプロキシ→直接接続フォールバックを誘発する。
+function classifySubmitError(err: Error, stage: string): SubmitResult {
+  const msg = err.message || String(err);
+  if (err.name === "TimeoutError") {
+    return { status: "failed", errorType: "TIMEOUT", errorMessage: `${msg}（段階: ${stage}）` };
+  }
+  if (
+    /net::ERR_|ERR_EMPTY_RESPONSE|ERR_CONNECTION|ERR_NAME_NOT_RESOLVED|ERR_PROXY|ERR_TIMED_OUT|ERR_ADDRESS_UNREACHABLE|ERR_SOCKET|ECONNRESET|ECONNREFUSED|ENOTFOUND|socket hang up/i.test(
+      msg,
+    )
+  ) {
+    return { status: "failed", errorType: "NETWORK_ERROR", errorMessage: `${msg}（段階: ${stage}）` };
+  }
+  return { status: "failed", errorType: "UNKNOWN", errorMessage: `${msg}（段階: ${stage}）` };
+}
+
 // core() の実行に「デッドライン監視」を付与する。overallMs を超えたら、その時点の
 // 画面を撮影し、どの段階で詰まったか (stageRef.s) を添えた TIMEOUT を返す。
 // これにより 1社あたりの時間切れでもスクリーンショットと原因を必ず記録できる。
@@ -1485,6 +1502,10 @@ async function runSubmit(
         httpStatus,
       });
     }
+
+    // リダイレクト (http→https / JS redirect) が落ち着くまで少し待つ。
+    // 直後に DOM を読むと "Execution context was destroyed" で落ちることがあるため。
+    await page.waitForTimeout(600).catch(() => {});
 
     stageRef.s = "フォーム検出";
     const form = await pickBestForm(page);
@@ -1620,13 +1641,8 @@ async function runSubmit(
 
     return result;
    } catch (e) {
-    const err = e as Error;
-    // 例外時 (タイムアウト/ナビゲーション失敗など) も、可能なら最終画面を残す。
-    const result: SubmitResult =
-      err.name === "TimeoutError"
-        ? { status: "failed", errorType: "TIMEOUT", errorMessage: `${err.message}（段階: ${stageRef.s}）` }
-        : { status: "failed", errorType: "UNKNOWN", errorMessage: err.message || String(e) };
-    return await attachShot(page, options, result);
+    // 例外時 (タイムアウト/接続失敗/ナビゲーション失敗など) も、可能なら最終画面を残す。
+    return await attachShot(page, options, classifySubmitError(e as Error, stageRef.s));
    }
   };
   try {
@@ -1831,6 +1847,9 @@ async function runSubmitAI(
       });
     }
 
+    // リダイレクトが落ち着くまで少し待つ (context destroyed 回避)
+    await page.waitForTimeout(600).catch(() => {});
+
     // キャプチャはバックグラウンドで解決開始
     stageRef.s = "AI: フォーム解析";
     let captchaHandle: CaptchaSolveHandle | null = null;
@@ -1946,13 +1965,8 @@ async function runSubmitAI(
     if (elapsed < 7000) await page.waitForTimeout(7000 - elapsed);
     return result;
    } catch (e) {
-    const err = e as Error;
-    console.warn("[runSubmitAI] error:", err.message ?? String(e));
-    const result: SubmitResult =
-      err.name === "TimeoutError"
-        ? { status: "failed", errorType: "TIMEOUT", errorMessage: `${err.message}（段階: ${stageRef.s}）` }
-        : { status: "failed", errorType: "UNKNOWN", errorMessage: err.message || String(e) };
-    return await attachShot(page, options, result);
+    console.warn("[runSubmitAI] error:", (e as Error).message ?? String(e));
+    return await attachShot(page, options, classifySubmitError(e as Error, stageRef.s));
    }
   };
   try {
