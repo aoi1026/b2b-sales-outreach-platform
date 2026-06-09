@@ -81,26 +81,25 @@ const USER_AGENT =
 const REQUIRED_FALLBACK_TEXT = "問い合わせ";
 
 // プロキシ設定を組み立てる (方式2: 送信ごとに sticky session を切り替える)。
-// PROXY_USERNAME に "{session}" プレースホルダがある場合のみ、呼び出し(=1送信)ごとに
-// 新しいトークンへ置換する。これにより「送信中はIP固定・社/試行ごとに別IP」となり、
-// ナビゲーション途中で出口IPが変わって net::ERR_NETWORK_CHANGED になる回転プロキシの
-// 不安定さを避けられる。
-//   例: PROXY_USERNAME="xxxx_country-jp_session-{session}_lifetime-10m"
-// プレースホルダが無ければユーザー名をそのまま使う (既定の挙動。プロバイダが sticky
-// 形式を受け付けない場合に誤った suffix で全送信が認証失敗するのを防ぐ)。
+// PROXY_USERNAME / PROXY_PASSWORD のどちらかに "{session}" プレースホルダがあれば、
+// 呼び出し(=1送信)ごとに新しいトークンへ置換する。同一トークン = 同一IP、別送信 = 別IP
+// となり、「送信中はIP固定・社/試行ごとに別IP」を実現する。これによりナビゲーション
+// 途中で出口IPが変わって net::ERR_NETWORK_CHANGED になる回転プロキシの不安定さを避ける。
+//   iProyal はセッション指定をパスワード側に付ける形式:
+//   PROXY_USERNAME="WTWZpmn7XLdU0OAz"
+//   PROXY_PASSWORD="Uwc68mxeSFebYqEi_country-jp_session-{session}_lifetime-30m"
+// プレースホルダが無ければ値をそのまま使う (既定の挙動)。
 function buildProxyConfig(
   useProxy: boolean,
 ): { server: string; username?: string; password?: string } | undefined {
   if (!useProxy) return undefined;
   const server = process.env["PROXY_SERVER"];
   if (!server) return undefined;
-  const baseUser = process.env["PROXY_USERNAME"];
-  const password = process.env["PROXY_PASSWORD"];
-  let username = baseUser;
-  if (baseUser && baseUser.includes("{session}")) {
-    const token = Math.random().toString(36).slice(2, 12);
-    username = baseUser.replace(/\{session\}/g, token);
-  }
+  const token = Math.random().toString(36).slice(2, 12);
+  const sub = (v: string | undefined): string | undefined =>
+    v && v.includes("{session}") ? v.replace(/\{session\}/g, token) : v;
+  const username = sub(process.env["PROXY_USERNAME"]);
+  const password = sub(process.env["PROXY_PASSWORD"]);
   return {
     server,
     ...(username ? { username } : {}),
@@ -118,6 +117,30 @@ async function scoreForm(form: ElementHandle<Element>): Promise<number> {
   const hasTextarea = (await form.$$("textarea")).length;
   const hasEmail = (await form.$$("input[type=email]")).length;
   return inputCount + hasTextarea * 2 + hasEmail * 3;
+}
+
+// プロキシのトンネル再接続等で一時的に出る net::ERR_NETWORK_CHANGED / ERR_PROXY 系は
+// 同一 sticky IP のまま再試行すれば通ることが多い。これらの過渡的ナビゲーション失敗のみ
+// 数回リトライする (恒久的な 4xx/5xx やDNS失敗は即 throw)。
+const TRANSIENT_NAV_RE =
+  /ERR_NETWORK_CHANGED|ERR_PROXY|ERR_TUNNEL|ERR_CONNECTION_RESET|ERR_CONNECTION_CLOSED|ERR_CONNECTION_ABORTED|ERR_EMPTY_RESPONSE|ERR_HTTP2_PROTOCOL_ERROR|socket hang up/i;
+
+async function gotoWithRetry(
+  page: Page,
+  url: string,
+  tries = 3,
+): Promise<Awaited<ReturnType<Page["goto"]>>> {
+  let lastErr: unknown;
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await page.goto(url, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT });
+    } catch (e) {
+      lastErr = e;
+      if (!TRANSIENT_NAV_RE.test((e as Error).message)) throw e;
+      await page.waitForTimeout(700 + i * 600).catch(() => {});
+    }
+  }
+  throw lastErr;
 }
 
 // SPA / 遅延描画フォーム対策: 入力欄 (または埋め込みフォームの iframe) が現れるまで待つ。
@@ -204,9 +227,7 @@ export async function locateForm(page: Page): Promise<ElementHandle<Element> | n
   // トップが弱い (1〜2入力) or 無い → 埋め込みフォームの方が豊かなら追従する
   const embed = await findEmbeddedForm(page);
   if (embed && embed.inputs > topInputs && embed.url !== page.url()) {
-    await page
-      .goto(embed.url, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT })
-      .catch(() => {});
+    await gotoWithRetry(page, embed.url).catch(() => {});
     await waitForFormRender(page);
     const f = await pickBestForm(page);
     if (f) return f;
@@ -1714,10 +1735,7 @@ async function runSubmit(
   const stageRef = { s: "ナビゲーション" };
   const core = async (): Promise<SubmitResult> => {
    try {
-    const response = await page.goto(formUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: NAV_TIMEOUT,
-    });
+    const response = await gotoWithRetry(page, formUrl);
     const httpStatus = response?.status() ?? 0;
     if (httpStatus >= 400) {
       return await attachShot(page, options, {
@@ -2048,10 +2066,7 @@ async function runSubmitAI(
   const stageRef = { s: "AI: ナビゲーション" };
   const core = async (): Promise<SubmitResult> => {
    try {
-    const response = await page.goto(formUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: NAV_TIMEOUT,
-    });
+    const response = await gotoWithRetry(page, formUrl);
     const httpStatus = response?.status() ?? 0;
     if (httpStatus >= 400) {
       return await attachShot(page, options, {
@@ -2213,7 +2228,25 @@ export async function submitFormWithAI(
   cachedPlan?: FillPlan,
 ): Promise<SubmitResult> {
   const proxyConfigured = !!process.env["PROXY_SERVER"];
-  return await runSubmitAI(formUrl, input, options, proxyConfigured, cachedPlan);
+  const overallMs = options?.timeoutMs ?? 170_000;
+  const deadline = Date.now() + overallMs;
+  const first = await runSubmitAI(formUrl, input, options, proxyConfigured, cachedPlan);
+  if (!proxyConfigured || first.status === "success") return first;
+  // プロキシ起因が疑われる失敗のみ直接接続でリトライ (submitForm と同じ方針)
+  if (first.errorType === "NETWORK_ERROR" || first.errorType === "TIMEOUT") {
+    const remaining = deadline - Date.now();
+    if (remaining < 10_000) return first;
+    const direct = await runSubmitAI(
+      formUrl,
+      input,
+      { ...options, timeoutMs: remaining },
+      false,
+      cachedPlan,
+    );
+    if (direct.status === "success") return direct;
+    return direct.screenshot && !first.screenshot ? direct : first;
+  }
+  return first;
 }
 
 // AI 解析機能が利用可能か (APIキーの有無)。
