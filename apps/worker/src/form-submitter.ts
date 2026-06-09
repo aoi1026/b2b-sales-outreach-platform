@@ -80,6 +80,34 @@ const USER_AGENT =
 // required を満たすためのフォールバック日本語
 const REQUIRED_FALLBACK_TEXT = "問い合わせ";
 
+// プロキシ設定を組み立てる (方式2: 送信ごとに sticky session を切り替える)。
+// PROXY_USERNAME に "{session}" プレースホルダがある場合のみ、呼び出し(=1送信)ごとに
+// 新しいトークンへ置換する。これにより「送信中はIP固定・社/試行ごとに別IP」となり、
+// ナビゲーション途中で出口IPが変わって net::ERR_NETWORK_CHANGED になる回転プロキシの
+// 不安定さを避けられる。
+//   例: PROXY_USERNAME="xxxx_country-jp_session-{session}_lifetime-10m"
+// プレースホルダが無ければユーザー名をそのまま使う (既定の挙動。プロバイダが sticky
+// 形式を受け付けない場合に誤った suffix で全送信が認証失敗するのを防ぐ)。
+function buildProxyConfig(
+  useProxy: boolean,
+): { server: string; username?: string; password?: string } | undefined {
+  if (!useProxy) return undefined;
+  const server = process.env["PROXY_SERVER"];
+  if (!server) return undefined;
+  const baseUser = process.env["PROXY_USERNAME"];
+  const password = process.env["PROXY_PASSWORD"];
+  let username = baseUser;
+  if (baseUser && baseUser.includes("{session}")) {
+    const token = Math.random().toString(36).slice(2, 12);
+    username = baseUser.replace(/\{session\}/g, token);
+  }
+  return {
+    server,
+    ...(username ? { username } : {}),
+    ...(password ? { password } : {}),
+  };
+}
+
 // ============= Form picker =============
 
 async function scoreForm(form: ElementHandle<Element>): Promise<number> {
@@ -90,6 +118,100 @@ async function scoreForm(form: ElementHandle<Element>): Promise<number> {
   const hasTextarea = (await form.$$("textarea")).length;
   const hasEmail = (await form.$$("input[type=email]")).length;
   return inputCount + hasTextarea * 2 + hasEmail * 3;
+}
+
+// SPA / 遅延描画フォーム対策: 入力欄 (または埋め込みフォームの iframe) が現れるまで待つ。
+// domcontentloaded 直後だと React/Vue 製フォームや kintone/formrun 等の埋め込みが未描画で
+// FORM_NOT_FOUND になっていたため、最大 maxMs まで描画を待ってから検出に進む。
+async function waitForFormRender(page: Page, maxMs = 8_000): Promise<void> {
+  await page
+    .waitForFunction(
+      () => {
+        const top = document.querySelectorAll(
+          "input:not([type=hidden]):not([type=submit]):not([type=button]), select, textarea",
+        ).length;
+        if (top >= 2) return true;
+        // 埋め込みフォーム (iframe) が存在すれば、そのロードを待つため true で抜ける
+        return document.querySelectorAll('iframe[src^="http"]').length > 0;
+      },
+      { timeout: maxMs },
+    )
+    .catch(() => {});
+  // iframe がそのコンテンツを読み込む猶予
+  await page.waitForTimeout(500).catch(() => {});
+}
+
+// 埋め込みフォーム (form.run / kintoneapp / MovableType Form / Pardot 等) は本体が
+// 子 iframe 内にあり、トップ document には <form> が無い。子 iframe のうち入力欄を多く
+// 持つもの (= 実フォーム) の URL を返す。呼び出し側はそこへ直接 goto し直すことで、
+// 以降のトップレベル処理 (入力・確認連鎖・成功判定・スクショ) をそのまま使える。
+const EMBED_FORM_HOST_RE =
+  /form\.run|kintoneapp\.com|formrun|movabletype\.net|hsforms\.|hubspot|pardot|formstack|formzu|tayori|docs\.google\.com\/forms|forms\.gle|shanon|cuenote|krs\.bz/i;
+
+const FORM_INPUT_SEL =
+  "input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=image]), select, textarea";
+
+async function countFormInputs(scope: {
+  $$eval: ElementHandle<Element>["$$eval"];
+}): Promise<number> {
+  return await scope.$$eval(FORM_INPUT_SEL, (els) => els.length).catch(() => 0);
+}
+
+// 埋め込み iframe フォームを探す。iframe は非同期にロードされるため maxMs まで
+// ポーリングし、入力欄を最も多く持つ子フレームの URL と入力数を返す。
+async function findEmbeddedForm(
+  page: Page,
+  maxMs = 6_000,
+): Promise<{ url: string; inputs: number } | null> {
+  const deadline = Date.now() + maxMs;
+  for (;;) {
+    let best: { url: string; inputs: number } | null = null;
+    let bestN = 2; // トップに無い分、3 以上を実フォームとみなす
+    for (const fr of page.frames()) {
+      if (fr === page.mainFrame()) continue;
+      const u = fr.url();
+      if (!u || !/^https?:/i.test(u)) continue;
+      let n = 0;
+      try {
+        n = await fr.evaluate(
+          (sel) => document.querySelectorAll(sel).length,
+          FORM_INPUT_SEL,
+        );
+      } catch {
+        // cross-origin で中を読めない場合は既知フォームホストの src を採用
+        n = EMBED_FORM_HOST_RE.test(u) ? 3 : 0;
+      }
+      if (n > bestN) {
+        bestN = n;
+        best = { url: u, inputs: n };
+      }
+    }
+    if (best) return best;
+    if (Date.now() >= deadline) return null;
+    await page.waitForTimeout(500);
+  }
+}
+
+// ナビゲーション後にフォームを確実に得る: 描画待ち → トップで検出 → トップが弱い/無い場合は
+// 埋め込み iframe の URL へ goto し直して再検出。戻り値は採用したフォーム (無ければ null)。
+export async function locateForm(page: Page): Promise<ElementHandle<Element> | null> {
+  await waitForFormRender(page);
+  const topForm = await pickBestForm(page);
+  const topInputs = topForm ? await countFormInputs(topForm) : 0;
+  // 十分な入力欄を持つトップフォームがあればそれを採用
+  if (topForm && topInputs >= 3) return topForm;
+
+  // トップが弱い (1〜2入力) or 無い → 埋め込みフォームの方が豊かなら追従する
+  const embed = await findEmbeddedForm(page);
+  if (embed && embed.inputs > topInputs && embed.url !== page.url()) {
+    await page
+      .goto(embed.url, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT })
+      .catch(() => {});
+    await waitForFormRender(page);
+    const f = await pickBestForm(page);
+    if (f) return f;
+  }
+  return topForm;
 }
 
 async function pickBestForm(
@@ -458,6 +580,15 @@ function stripSpaces(s: string | null | undefined): string | null {
   return s.replace(/[\s　]+/g, "");
 }
 
+// 半角 ASCII (英数記号) と半角スペースを全角に変換する。
+// 「全角で入力してください」を要求するフォーム (krs.bz 等) で、半角スペースや
+// 半角記号が混じった住所などが弾かれるのを防ぐ。
+function toFullWidth(s: string): string {
+  return s
+    .replace(/[!-~]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 0xfee0))
+    .replace(/ /g, "　");
+}
+
 // 氏名 (漢字/ひらがな/カタカナ) を 姓/名 に分割する。
 // 空白 (半角/全角) があればそこで分割。無ければおおよそ半分で分割し、姓を前半とする。
 // 空白なしの厳密分割は不可能なため、偶数長は半々、奇数長は姓 (前半) を1文字多くする。
@@ -763,39 +894,110 @@ async function fillSplitGroups(
 
 // ============= Select handling =============
 
-// <select> 要素は2番目以降の <option> のうち、value が空でなく disabled でない
-// 最初のものを選択する。1 番目は「選択してください」等のプレースホルダー想定。
-// すべてが無効なら最後の手段として 1 番目を選ぶ。
-async function processSelects(form: ElementHandle<Element>): Promise<void> {
-  const selects = await form.$$("select");
-  for (const sel of selects) {
+// 同意/必須チェックボックスと判定するキーワード (name/id/label 共通)。
+const CONSENT_RE =
+  /同意|承諾|プライバシー|個人情報|利用規約|規約|consent|agree|accept|privacy|terms|doui/i;
+
+// チェックボックスのラベル文字列 (label[for], 親<label>, 隣接要素) を取得。
+async function readCheckboxLabel(
+  cb: ElementHandle<Element>,
+  page: Page,
+  id: string,
+): Promise<string> {
+  let labelText = "";
+  if (id) {
+    labelText = await page
+      .evaluate((idVal: string) => {
+        const lbl = document.querySelector(`label[for="${CSS.escape(idVal)}"]`);
+        return (lbl?.textContent ?? "").trim();
+      }, id)
+      .catch(() => "");
+  }
+  if (!labelText) {
+    labelText = await cb
+      .evaluate((node) => {
+        const parent = node.closest("label");
+        if (parent) return (parent.textContent ?? "").trim();
+        const next = node.nextElementSibling;
+        return (next?.textContent ?? "").trim();
+      })
+      .catch(() => "");
+  }
+  return labelText;
+}
+
+// select / radio / checkbox を一括処理し、各フィールドで「最低1つ選択済み」を保証する
+// (ユーザ要件)。フォーム内の選択系入力をここに集約 (旧 processSelects/processCheckboxes/
+// processRadios/ensureAgreementsChecked/ensureAtLeastOneCheckboxChecked を統合)。
+//  - select  : 未選択なら2番目以降の有効 option (無ければ先頭の有効値) を選ぶ。
+//  - radio   : name グループごとに、未選択なら先頭をチェック。
+//  - checkbox: 同意/必須系を必ずチェック。どれも未チェックなら先頭をチェック。
+async function applyChoiceDefaults(
+  page: Page,
+  form: ElementHandle<Element>,
+): Promise<void> {
+  // ---- <select> ----
+  for (const sel of await form.$$("select")) {
     try {
+      const cur = await sel.evaluate((n) => (n as HTMLSelectElement).value);
+      if (cur && cur.trim() !== "") continue; // 既に選択済み
       const options = await sel.$$eval("option", (opts) =>
-        (opts as HTMLOptionElement[]).map((o) => ({
-          value: o.value,
-          disabled: o.disabled,
-        })),
+        (opts as HTMLOptionElement[]).map((o) => ({ value: o.value, disabled: o.disabled })),
       );
-      if (options.length === 0) continue;
+      const valid =
+        options.find((o, i) => i > 0 && o.value.trim() !== "" && !o.disabled) ??
+        options.find((o) => o.value.trim() !== "" && !o.disabled);
+      if (valid) await sel.selectOption(valid.value).catch(() => {});
+    } catch {
+      /* ignore */
+    }
+  }
 
-      // 2 番目以降の有効な option を優先
-      const valid = options.find(
-        (o, idx) => idx > 0 && o.value.trim() !== "" && !o.disabled,
-      );
+  // ---- radio: name グループごとに未選択なら先頭をチェック ----
+  const radios = await form.$$('input[type="radio"]');
+  const groups = new Map<string, ElementHandle<Element>[]>();
+  for (const r of radios) {
+    const name = ((await r.getAttribute("name")) ?? "").toLowerCase();
+    const key = name || `__nogroup_${groups.size}`;
+    const list = groups.get(key) ?? [];
+    list.push(r);
+    groups.set(key, list);
+  }
+  for (const list of groups.values()) {
+    const anyChecked = await Promise.all(
+      list.map((r) => (r as ElementHandle<HTMLInputElement>).isChecked().catch(() => false)),
+    ).then((arr) => arr.some(Boolean));
+    if (!anyChecked && list[0]) await checkOrClickLabel(list[0], page);
+  }
 
-      if (valid) {
-        await sel.selectOption(valid.value);
-      } else {
-        // 全部 disabled / 空の場合は先頭 (それしか選べない)
-        const first = options[0];
-        if (first && !first.disabled && first.value.trim() !== "") {
-          await sel.selectOption(first.value);
-        }
+  // ---- checkbox: 同意/必須を必ずチェック + 最低1つ保証 ----
+  const checkboxes = await form.$$('input[type="checkbox"]');
+  if (checkboxes.length === 0) return;
+  let anyChecked = false;
+  for (const cb of checkboxes) {
+    try {
+      if (await (cb as ElementHandle<HTMLInputElement>).isChecked()) {
+        anyChecked = true;
+        continue;
+      }
+      const id = (await cb.getAttribute("id")) ?? "";
+      const nameAttr = ((await cb.getAttribute("name")) ?? "").toLowerCase();
+      const required = await cb.evaluate((n) => (n as HTMLInputElement).required).catch(() => false);
+      const labelText = await readCheckboxLabel(cb, page, id);
+      const isConsent =
+        required ||
+        CONSENT_RE.test(`${nameAttr}|${id.toLowerCase()}`) ||
+        CONSENT_RE.test(labelText);
+      if (isConsent) {
+        await checkOrClickLabel(cb, page);
+        anyChecked = true;
       }
     } catch {
       /* ignore */
     }
   }
+  // どの checkbox もチェックされていなければ先頭をチェック (単独必須同意ボックス対策)
+  if (!anyChecked && checkboxes[0]) await checkOrClickLabel(checkboxes[0], page);
 }
 
 // ============= Text-like field filling (input + textarea) =============
@@ -842,27 +1044,20 @@ async function fillTextLikeFields(
 
     if (value === undefined || value === null || value === "") continue;
 
+    // 「全角」を要求する欄 (combined に全角ヒント) では半角を全角へ変換する。
+    // メール/URL/電話/郵便番号は半角必須なので除外。
+    if (
+      /全角/.test(meta.combined) &&
+      !["email", "email_confirm", "url", "phone", "fax", "postal_code"].includes(role ?? "")
+    ) {
+      value = toFullWidth(value);
+    }
+
     const ok = await safeFill(el, value);
     if (ok) filled++;
   }
 
   return filled;
-}
-
-// ============= Checkbox handling =============
-
-async function processCheckboxes(
-  page: Page,
-  form: ElementHandle<Element>,
-): Promise<void> {
-  const checkboxes = await form.$$('input[type="checkbox"]');
-  if (checkboxes.length === 0) return;
-
-  // 全 checkbox を確実にチェック。display:none の場合は label 経由でクリックする。
-  // (Satori の satori__privacy_policy_agreement 等)
-  for (const cb of checkboxes) {
-    await checkOrClickLabel(cb, page);
-  }
 }
 
 // ============= Required field final validation =============
@@ -911,32 +1106,8 @@ async function ensureAllRequiredFilled(
         continue;
       }
 
-      // ----- input[type=checkbox] -----
-      if (tagName === "input" && type === "checkbox") {
-        const checked = await (el as ElementHandle<HTMLInputElement>).isChecked();
-        if (!checked) {
-          await checkOrClickLabel(el, page);
-        }
-        continue;
-      }
-
-      // ----- input[type=radio] -----
-      if (tagName === "input" && type === "radio") {
-        const name = (await el.getAttribute("name")) ?? "";
-        if (name) {
-          // 同じ name グループのうち1つでも checked なら何もしない
-          const anyChecked = await form.$$eval(
-            `input[type="radio"][name="${name.replace(/"/g, '\\"')}"]`,
-            (radios) => (radios as HTMLInputElement[]).some((r) => r.checked),
-          );
-          if (!anyChecked) {
-            await checkOrClickLabel(el, page);
-          }
-        } else {
-          await checkOrClickLabel(el, page);
-        }
-        continue;
-      }
+      // checkbox / radio は applyChoiceDefaults で選択保証済みのためここでは扱わない。
+      if (tagName === "input" && (type === "checkbox" || type === "radio")) continue;
 
       // ----- input[type=date] -----
       if (tagName === "input" && type === "date") {
@@ -981,105 +1152,6 @@ async function ensureAllRequiredFilled(
     } catch {
       /* 個別要素の失敗は無視。可能な限り進める */
     }
-  }
-}
-
-// ラベルテキスト経由で「プライバシーポリシー / 利用規約 / 個人情報保護方針 に同意」
-// 系のチェックボックスを検出してチェック。id/name に agree が含まれない
-// (= processCheckboxes で取りこぼした) ケースを救う。
-async function ensureAgreementsChecked(
-  page: Page,
-  form: ElementHandle<Element>,
-): Promise<void> {
-  const checkboxes = await form.$$('input[type="checkbox"]');
-  for (const cb of checkboxes) {
-    try {
-      const isChecked = await (cb as ElementHandle<HTMLInputElement>).isChecked();
-      if (isChecked) continue;
-
-      // ラベル文字列を組み立てる: <label for=id>, 親<label>, 隣接テキスト
-      let labelText = "";
-      const id = (await cb.getAttribute("id")) ?? "";
-      if (id) {
-        labelText = await page.evaluate((idVal: string) => {
-          const lbl = document.querySelector(`label[for="${CSS.escape(idVal)}"]`);
-          return (lbl?.textContent ?? "").trim();
-        }, id);
-      }
-      if (!labelText) {
-        labelText = await cb.evaluate((node) => {
-          const parent = node.closest("label");
-          if (parent) return (parent.textContent ?? "").trim();
-          // 兄弟要素のテキスト (<input><span>同意する</span> パターン)
-          const next = node.nextElementSibling;
-          return (next?.textContent ?? "").trim();
-        });
-      }
-
-      // name / id に同意系キーワードを含む同意チェックボックスも対象にする。
-      // Contact Form 7 の name="acceptance-383" のように、ラベル文言が拾えなくても
-      // 属性から同意ボックスと判定できるケースを救う (ユーザ要件)。
-      const nameAttr = ((await cb.getAttribute("name")) ?? "").toLowerCase();
-      const attrAgree = /agree|accept|consent|privacy|terms|doui|同意|承諾|規約|個人情報/i.test(
-        `${nameAttr}|${id.toLowerCase()}`,
-      );
-
-      if (
-        attrAgree ||
-        /同意|承諾|プライバシー|個人情報|利用規約|規約|consent|agree|accept|privacy|terms/i.test(
-          labelText,
-        )
-      ) {
-        await checkOrClickLabel(cb, page);
-      }
-    } catch {
-      /* ignore */
-    }
-  }
-}
-
-// フォーム内に checkbox が1つでもあって、まだ何もチェックされていなければ先頭をチェック。
-// (processCheckboxes は agree 系か "name 同一が2個以上" でしかチェックしないため、
-//  単独 checkbox が必須なケースを救う)
-async function ensureAtLeastOneCheckboxChecked(
-  page: Page,
-  form: ElementHandle<Element>,
-): Promise<void> {
-  const checkboxes = await form.$$('input[type="checkbox"]');
-  if (checkboxes.length === 0) return;
-  const anyChecked = await form.$$eval(
-    'input[type="checkbox"]',
-    (els) => (els as HTMLInputElement[]).some((cb) => cb.checked),
-  );
-  if (!anyChecked) {
-    await checkOrClickLabel(checkboxes[0]!, page);
-  }
-}
-
-// ============= Radio handling =============
-
-async function processRadios(
-  page: Page,
-  form: ElementHandle<Element>,
-): Promise<void> {
-  const radios = await form.$$('input[type="radio"]');
-  if (radios.length === 0) return;
-
-  // name 属性でグループ化し、各グループの先頭を選択。display:none の場合は label 経由。
-  // name 属性が無いラジオは for 属性が "satori__custom_field" 等のラベルでまとめられて
-  // いる可能性があるため、name が空のものは個別グループにする。
-  const groupByName = new Map<string, ElementHandle<Element>[]>();
-  for (const r of radios) {
-    const name = ((await r.getAttribute("name")) ?? "").toLowerCase();
-    const key = name || `__${groupByName.size}`;
-    const list = groupByName.get(key) ?? [];
-    list.push(r);
-    groupByName.set(key, list);
-  }
-
-  for (const list of groupByName.values()) {
-    if (list.length === 0) continue;
-    await checkOrClickLabel(list[0]!, page);
   }
 }
 
@@ -1383,13 +1455,19 @@ async function clickConfirmationChain(
 // 以前は /error/i など緩いパターンで footer/メタ等の関係ない "error" 文字列に
 // 誤反応していた。下のパターンは「フォーム送信文脈っぽい日本語/英語」に絞る。
 
+// 注意: 確認画面 (「この内容で送信されます」「送信ボタンを押してください」等) を成功と
+// 誤検知しないため、完了を表す語尾 (〜ました/〜完了) に限定する。未来形「送信されます」や
+// 「送信する」は成功にしない。
 const SUCCESS_PATTERNS = [
   /送信(?:が)?完了/,
-  /送信(?:が)?(?:され|済)(?:ました)?/,
-  /送信いたしました/,
+  /送信(?:が|を)?(?:され|いたし|済み)ました/, // 送信されました/送信いたしました
+  /送信(?:を)?しました/, // 送信しました
+  /(?:メッセージ|内容|フォーム)(?:を)?(?:送信|お送り)(?:しました|いたしました)/,
+  /(?:お申し?込み?|申込|登録)(?:を)?(?:受け付けました|受付ました|完了(?:しました|いたしました))/,
+  /(?:正常|無事)に(?:送信|完了|受付)/,
   /受け付け(?:ました|完了|いたしました)/,
-  /受付(?:を)?完了/,
-  /(?:お問い?合わ?せ|ご連絡|ご質問).*(?:ありがと|受け付け|送信|承り)/,
+  /受付(?:を)?(?:完了(?:しました)?|いたしました|ました)/,
+  /(?:お問い?合わ?せ|ご連絡|ご質問).*(?:ありがとうございま|受け付けました|承りました)/,
   // 「お問い合わせありがとうございました」「ご連絡ありがとうございます」等
   /ありがとうござい(?:ます|ました)/,
   /(?:担当(?:者|部署)|後日|後ほど|改めて).*(?:ご連絡|ご返信|返信|連絡)/,
@@ -1626,14 +1704,10 @@ async function runSubmit(
   useProxy: boolean,
 ): Promise<SubmitResult> {
   const browser = await getBrowser();
-  const proxyServer = useProxy ? process.env["PROXY_SERVER"] : undefined;
-  const proxyUsername = process.env["PROXY_USERNAME"];
-  const proxyPassword = process.env["PROXY_PASSWORD"];
+  const proxy = buildProxyConfig(useProxy);
   const context = await browser.newContext({
     userAgent: USER_AGENT,
-    ...(proxyServer
-      ? { proxy: { server: proxyServer, username: proxyUsername, password: proxyPassword } }
-      : {}),
+    ...(proxy ? { proxy } : {}),
   });
   const page = await context.newPage();
   const overallMs = options?.timeoutMs ?? 170_000;
@@ -1659,7 +1733,8 @@ async function runSubmit(
     await page.waitForTimeout(600).catch(() => {});
 
     stageRef.s = "フォーム検出";
-    const form = await pickBestForm(page);
+    // 描画待ち + 埋め込み iframe フォームへの追従を含めて検出する
+    const form = await locateForm(page);
     if (!form) {
       return await attachShot(page, options, {
         status: "failed",
@@ -1692,18 +1767,12 @@ async function runSubmit(
       });
     }
 
-    // 3) <select>, checkbox, radio を処理 (radios/checkboxes は label 経由 click 対応)
-    await processSelects(form);
-    await processCheckboxes(page, form);
-    await processRadios(page, form);
+    // 3) select / radio / checkbox を一括処理し各フィールドで最低1つ選択を保証
+    //    (旧 processSelects/Checkboxes/Radios + 同意チェックを applyChoiceDefaults に統合)
+    await applyChoiceDefaults(page, form);
 
-    // 4) 最終セーフティネット: required 属性付きで未充填の要素をすべて埋める
-    //    (input/textarea/checkbox/radio/select/date/number 等を網羅)
+    // 4) 最終セーフティネット: required 属性付きで未充填の text/textarea/select/date/number を埋める
     await ensureAllRequiredFilled(page, form, input);
-    // ラベル経由で「プライバシーポリシーに同意」系の checkbox をチェック
-    await ensureAgreementsChecked(page, form);
-    // checkbox が1つもチェックされていなければ先頭をチェック (必須同意ボックス対策)
-    await ensureAtLeastOneCheckboxChecked(page, form);
 
     // キャプチャトークンをページに注入 (バックグラウンド解決の完了を待つ)
     let captchaTokenInjected = false;
@@ -1969,18 +2038,10 @@ async function runSubmitAI(
   cachedPlan?: FillPlan,
 ): Promise<SubmitResult> {
   const browser = await getBrowser();
-  const proxyServer = useProxy ? process.env["PROXY_SERVER"] : undefined;
+  const proxy = buildProxyConfig(useProxy);
   const context = await browser.newContext({
     userAgent: USER_AGENT,
-    ...(proxyServer
-      ? {
-          proxy: {
-            server: proxyServer,
-            username: process.env["PROXY_USERNAME"],
-            password: process.env["PROXY_PASSWORD"],
-          },
-        }
-      : {}),
+    ...(proxy ? { proxy } : {}),
   });
   const page = await context.newPage();
   const overallMs = options?.timeoutMs ?? 170_000;
@@ -2003,6 +2064,10 @@ async function runSubmitAI(
 
     // リダイレクトが落ち着くまで少し待つ (context destroyed 回避)
     await page.waitForTimeout(600).catch(() => {});
+
+    // 描画待ち + 埋め込み iframe フォームへの追従 (戻り値の form は使わず副作用の
+    // goto だけ利用)。これで snapshot が実フォームを拾えるようにする。
+    await locateForm(page);
 
     // キャプチャはバックグラウンドで解決開始
     stageRef.s = "AI: フォーム解析";
@@ -2039,6 +2104,11 @@ async function runSubmitAI(
     const usedPlan: FillPlan = plan;
 
     await executeFillPlan(page, usedPlan);
+
+    // AI プランが取りこぼした選択系 (同意チェックボックス・select・radio) を保証する
+    // セーフティネット。CF7 の acceptance-383 等を AI が check し損ねても確実に有効化する。
+    const aiForm = await pickBestForm(page);
+    if (aiForm) await applyChoiceDefaults(page, aiForm).catch(() => {});
 
     stageRef.s = "AI: 送信";
 

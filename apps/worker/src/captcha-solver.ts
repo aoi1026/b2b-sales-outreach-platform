@@ -146,6 +146,34 @@ export async function detectCaptcha(page: Page): Promise<CaptchaInfo | null> {
       }
     }
 
+    // 4. レンダリング済み reCAPTCHA の anchor/bframe iframe から sitekey (k=) を抽出。
+    //    「protected by reCAPTCHA」バッジだけ出る invisible 型や、GTM/タグ経由で
+    //    動的注入され script src の render= では拾えないケースを救う (ユーザ要件)。
+    for (const iframe of Array.from(document.querySelectorAll<HTMLIFrameElement>("iframe"))) {
+      const m = iframe.src.match(
+        /recaptcha\/(?:enterprise|api2)\/(?:anchor|bframe)[^"']*[?&]k=([^&"']+)/,
+      );
+      if (m?.[1]) {
+        const siteKey = decodeURIComponent(m[1]);
+        const isEnterprise = iframe.src.includes("/enterprise/");
+        // 可視チェックボックス (data-size!=invisible の g-recaptcha) があれば v2、
+        // バッジのみ / invisible 指定なら v3 相当として扱う。
+        const visibleCheckbox = document.querySelector<HTMLElement>(
+          '.g-recaptcha:not([data-size="invisible"])',
+        );
+        const badge = document.querySelector(".grecaptcha-badge");
+        const invisible = document.querySelector('.g-recaptcha[data-size="invisible"]');
+        if (visibleCheckbox && !invisible) {
+          return { type: "recaptcha-v2", siteKey, isEnterprise };
+        }
+        if (badge || invisible) {
+          return { type: "recaptcha-v3", siteKey, pageAction: "submit", isEnterprise };
+        }
+        // 判別不能でもキーは取れている — v2 として解く (token を textarea へ注入)
+        return { type: "recaptcha-v2", siteKey, isEnterprise };
+      }
+    }
+
     return null;
   });
 }
