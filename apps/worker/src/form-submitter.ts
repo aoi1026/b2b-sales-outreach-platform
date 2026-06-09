@@ -67,6 +67,10 @@ type FieldRole =
   | "person_hiragana"
   | "person_last"
   | "person_first"
+  | "person_kana_last"
+  | "person_kana_first"
+  | "person_hiragana_last"
+  | "person_hiragana_first"
   | null;
 
 const NAV_TIMEOUT = 30_000;
@@ -264,7 +268,7 @@ type ElementMeta = Awaited<ReturnType<typeof getElementMeta>>;
 
 // ============= Field role detection =============
 
-function detectFieldRole(meta: ElementMeta): FieldRole {
+export function detectFieldRole(meta: ElementMeta): FieldRole {
   const { tagName, type, idLower, nameLower, combined, autocomplete } = meta;
   const idOrName = `${idLower}|${nameLower}`;
 
@@ -314,6 +318,36 @@ function detectFieldRole(meta: ElementMeta): FieldRole {
     return "phone";
   }
   if (type === "url") return "url";
+
+  // ====== 氏名の分割欄 (姓/名 × 文字種) ======
+  // 姓/名 に分かれた氏名欄を、文字種 (漢字/ひらがな/カタカナ) と合わせて判定する。
+  // 例: lastName/firstName (漢字), lastNameKana+placeholder「せい/めい」(ひらがな),
+  //     sei/mei+placeholder「セイ/メイ」(カタカナ)。
+  // ここで先に確定させることで、"lastNameKana" が後段の lastname ルールに拾われて
+  // 漢字氏名がひらがな欄へ流し込まれる誤りを防ぐ。
+  {
+    const ph = meta.placeholder; // 原文 (カタカナ/ひらがな判定のため小文字化しない)
+    const partLast =
+      /(?:^|[_\-])last[_\-]?name|lastname|(?:^|[_\-])sei(?:[_\-]|$)|family[_\-]?name|surname|姓|myoji|苗字|名字/.test(idOrName) ||
+      /(?:^|[^ぁ-ゖ])せい(?:[^ぁ-ゖ]|$)|セイ|^\s*姓\s*$/.test(ph);
+    const partFirst =
+      /(?:^|[_\-])first[_\-]?name|firstname|(?:^|[_\-])mei(?:[_\-]|$)|given[_\-]?name/.test(idOrName) ||
+      /(?:^|[^ぁ-ゖ])めい(?:[^ぁ-ゖ]|$)|メイ|^\s*名\s*$/.test(ph);
+    if (partLast || partFirst) {
+      const hira =
+        /hira(?:gana)?|ひらがな/.test(idOrName) ||
+        /ひらがな/.test(combined) ||
+        /(?:^|[^ぁ-ゖ])(?:せい|めい)(?:[^ぁ-ゖ]|$)/.test(ph);
+      const kata =
+        !hira &&
+        (/katakana|furigana|gana|(?:^|[_\-])kana(?:[_\-]|$)|kana|フリガナ|カナ|カタカナ/.test(idOrName) ||
+          /フリガナ|カナ|カタカナ/.test(combined) ||
+          /セイ|メイ/.test(ph));
+      if (partLast)
+        return hira ? "person_hiragana_last" : kata ? "person_kana_last" : "person_last";
+      return hira ? "person_hiragana_first" : kata ? "person_kana_first" : "person_first";
+    }
+  }
 
   // ====== id/name の specific patterns (ユーザ要件) ======
 
@@ -424,7 +458,28 @@ function stripSpaces(s: string | null | undefined): string | null {
   return s.replace(/[\s　]+/g, "");
 }
 
-function pickValueForRole(role: FieldRole, input: FormInput): string | null {
+// 氏名 (漢字/ひらがな/カタカナ) を 姓/名 に分割する。
+// 空白 (半角/全角) があればそこで分割。無ければおおよそ半分で分割し、姓を前半とする。
+// 空白なしの厳密分割は不可能なため、偶数長は半々、奇数長は姓 (前半) を1文字多くする。
+// 例: "白石秀彦"→{山,名}=白石/秀彦, "しらいしひでひこ"→しらいし/ひでひこ。
+export function splitNameParts(full: string | null | undefined): {
+  last: string | null;
+  first: string | null;
+} {
+  if (!full) return { last: null, first: null };
+  const trimmed = full.trim();
+  if (!trimmed) return { last: null, first: null };
+  const bySpace = trimmed.split(/[\s　]+/).filter(Boolean);
+  if (bySpace.length >= 2) {
+    return { last: bySpace[0]!, first: bySpace.slice(1).join("") };
+  }
+  const chars = Array.from(trimmed); // サロゲートペア安全
+  if (chars.length < 2) return { last: trimmed, first: null };
+  const cut = Math.ceil(chars.length / 2);
+  return { last: chars.slice(0, cut).join(""), first: chars.slice(cut).join("") };
+}
+
+export function pickValueForRole(role: FieldRole, input: FormInput): string | null {
   if (!role) return null;
   switch (role) {
     case "email":
@@ -473,9 +528,21 @@ function pickValueForRole(role: FieldRole, input: FormInput): string | null {
     case "person_hiragana":
       return stripSpaces(input.personHiragana ?? input.person);
     case "person_last":
-      return input.personLast ?? input.person ?? null;
+      // 事前分割 (personLast) を優先。無ければ氏名を半分割した姓。
+      return input.personLast ?? splitNameParts(input.person).last ?? input.person ?? null;
     case "person_first":
-      return input.personFirst ?? null;
+      // 事前分割 (personFirst) を優先。無ければ氏名を半分割した名。
+      return input.personFirst ?? splitNameParts(input.person).first;
+    case "person_kana_last":
+      // カタカナ姓: 専用カタカナ → 汎用カナの順で分割。空白除去。
+      return stripSpaces(splitNameParts(input.personKatakana ?? input.personKana).last);
+    case "person_kana_first":
+      return stripSpaces(splitNameParts(input.personKatakana ?? input.personKana).first);
+    case "person_hiragana_last":
+      // ひらがな姓: ひらがな氏名を分割。空白除去。
+      return stripSpaces(splitNameParts(input.personHiragana).last);
+    case "person_hiragana_first":
+      return stripSpaces(splitNameParts(input.personHiragana).first);
     default:
       return null;
   }
@@ -949,8 +1016,17 @@ async function ensureAgreementsChecked(
         });
       }
 
+      // name / id に同意系キーワードを含む同意チェックボックスも対象にする。
+      // Contact Form 7 の name="acceptance-383" のように、ラベル文言が拾えなくても
+      // 属性から同意ボックスと判定できるケースを救う (ユーザ要件)。
+      const nameAttr = ((await cb.getAttribute("name")) ?? "").toLowerCase();
+      const attrAgree = /agree|accept|consent|privacy|terms|doui|同意|承諾|規約|個人情報/i.test(
+        `${nameAttr}|${id.toLowerCase()}`,
+      );
+
       if (
-        /同意|承諾|プライバシー|個人情報|利用規約|規約|consent|agree|privacy|terms/i.test(
+        attrAgree ||
+        /同意|承諾|プライバシー|個人情報|利用規約|規約|consent|agree|accept|privacy|terms/i.test(
           labelText,
         )
       ) {
@@ -1782,7 +1858,7 @@ function inputToFillValues(input: FormInput) {
 }
 
 // ページ上のフォーム項目・ボタンを Claude に渡せる形へ抽出する。
-async function extractFormSnapshot(
+export async function extractFormSnapshot(
   page: Page,
 ): Promise<{ fields: FieldDescriptor[]; buttons: ButtonDescriptor[] }> {
   return await page.evaluate(() => {

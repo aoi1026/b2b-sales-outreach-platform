@@ -6,6 +6,7 @@ import {
   submitFormWithAI,
   isAIFormAnalyzerEnabled,
   closeBrowser,
+  splitNameParts,
 } from "./form-submitter.ts";
 import type { FillPlan } from "./ai-form-analyzer.ts";
 import type { DeliveryJobPayload, FormInput } from "./types.ts";
@@ -85,20 +86,6 @@ function applyVars(text: string, companyName: string): string {
   return text
     .replace(/\{\{\s*会社名\s*\}\}/g, companyName)
     .replace(/\{\{\s*担当者名\s*\}\}/g, "ご担当者");
-}
-
-// 「山田 太郎」→ { last: "山田", first: "太郎" }
-// 半角/全角スペースで分割。スペース無しは全体を last_name 扱い
-function splitJapaneseName(fullName: string | null | undefined): {
-  last: string | null;
-  first: string | null;
-} {
-  if (!fullName) return { last: null, first: null };
-  const parts = fullName.split(/[\s　]+/).filter(Boolean);
-  if (parts.length >= 2) {
-    return { last: parts[0]!, first: parts.slice(1).join(" ") };
-  }
-  return { last: fullName, first: null };
 }
 
 async function ensureJobResultRows(jobId: string): Promise<void> {
@@ -233,7 +220,7 @@ export async function processDeliveryJob(
     }
 
     const personName = job.senderTemplate?.personName ?? null;
-    const { last: personLast, first: personFirst } = splitJapaneseName(personName);
+    const { last: personLast, first: personFirst } = splitNameParts(personName);
 
     const input: FormInput = {
       company: job.senderTemplate?.companyName ?? null,
