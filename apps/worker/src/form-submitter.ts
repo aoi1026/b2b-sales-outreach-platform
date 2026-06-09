@@ -1492,6 +1492,24 @@ function classifySubmitError(err: Error, stage: string): SubmitResult {
   return { status: "failed", errorType: "UNKNOWN", errorMessage: `${msg}（段階: ${stage}）` };
 }
 
+// CAPTCHA が検出されたページで送信が失敗した場合、汎用の VALIDATION_ERROR/UNKNOWN を
+// CAPTCHA_FAILED に再分類する。CAPTCHA の有無は失敗の主因を見分ける強いシグナルなので、
+// メトリクス上で「CAPTCHA 壁による失敗」を切り分けられるようにする。
+// 注: フィールド未充填など別要因の可能性も残るため、メッセージにトークン注入状況を残す。
+function applyCaptchaClassification(
+  result: SubmitResult,
+  detected: boolean,
+  tokenInjected: boolean,
+): SubmitResult {
+  if (result.status !== "failed" || !detected) return result;
+  if (result.errorType !== "VALIDATION_ERROR" && result.errorType !== "UNKNOWN") return result;
+  result.errorType = "CAPTCHA_FAILED";
+  result.errorMessage = tokenInjected
+    ? "CAPTCHA を検出しトークンを注入しましたが、送信が拒否されました（スコア不足/検証失敗の可能性）。"
+    : "CAPTCHA を検出しましたが、解決トークンを取得できず送信できませんでした。";
+  return result;
+}
+
 // core() の実行に「デッドライン監視」を付与する。overallMs を超えたら、その時点の
 // 画面を撮影し、どの段階で詰まったか (stageRef.s) を添えた TIMEOUT を返す。
 // これにより 1社あたりの時間切れでもスクリーンショットと原因を必ず記録できる。
@@ -1612,9 +1630,10 @@ async function runSubmit(
     await ensureAtLeastOneCheckboxChecked(page, form);
 
     // キャプチャトークンをページに注入 (バックグラウンド解決の完了を待つ)
+    let captchaTokenInjected = false;
     if (captchaHandle) {
       try {
-        await injectCaptchaToken(page, captchaHandle);
+        captchaTokenInjected = await injectCaptchaToken(page, captchaHandle);
       } catch {
         /* 注入失敗は無視して送信を試みる */
       }
@@ -1689,6 +1708,8 @@ async function runSubmit(
         httpStatus,
       };
     }
+    // CAPTCHA 検出ページの失敗は CAPTCHA_FAILED に再分類する
+    result = applyCaptchaClassification(result, captchaHandle !== null, captchaTokenInjected);
     if (shot) result.screenshot = shot;
 
     // ユーザ要件: 最終送信ボタン押下からこのサイトに「7秒間」は留まってから次へ進む
@@ -1945,9 +1966,10 @@ async function runSubmitAI(
 
     stageRef.s = "AI: 送信";
 
+    let captchaTokenInjected = false;
     if (captchaHandle) {
       try {
-        await injectCaptchaToken(page, captchaHandle);
+        captchaTokenInjected = await injectCaptchaToken(page, captchaHandle);
       } catch {
         /* 注入失敗は無視 */
       }
@@ -2014,6 +2036,8 @@ async function runSubmitAI(
         httpStatus,
       };
     }
+    // CAPTCHA 検出ページの失敗は CAPTCHA_FAILED に再分類する
+    result = applyCaptchaClassification(result, captchaHandle !== null, captchaTokenInjected);
     if (shot) result.screenshot = shot;
     // 学習用: 実行したプランを結果に添付 (成功時に job-processor がレシピ保存する)
     result.recipe = usedPlan;

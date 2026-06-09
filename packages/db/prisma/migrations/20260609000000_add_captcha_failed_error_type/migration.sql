@@ -1,0 +1,2 @@
+-- Add CAPTCHA_FAILED to DeliveryErrorType enum
+ALTER TYPE "DeliveryErrorType" ADD VALUE IF NOT EXISTS 'CAPTCHA_FAILED';

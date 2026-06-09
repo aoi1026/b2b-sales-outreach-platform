@@ -14,6 +14,7 @@
     "build": "npm run db:generate && npm run build --workspace=@mvp/admin",
     "db:generate": "npm run generate --workspace=@mvp/db",
     "db:migrate": "npm run migrate --workspace=@mvp/db",
+    "db:migrate:deploy": "npm run migrate:deploy --workspace=@mvp/db",
     "db:push": "npm run db:push --workspace=@mvp/db",
     "db:studio": "npm run studio --workspace=@mvp/db",
     "db:seed": "npm run seed --workspace=@mvp/db",
@@ -26,7 +27,7 @@
     "concurrently": "^9.2.1"
   },
   "dependencies": {
-    "@prisma/client": "^7.8.0",
-    "prisma": "^7.8.0"
+    "@prisma/client": "^6.1.0",
+    "prisma": "^6.1.0"
   }
 }

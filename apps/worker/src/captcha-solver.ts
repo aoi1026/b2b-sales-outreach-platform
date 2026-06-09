@@ -275,6 +275,10 @@ export async function startCaptchaSolve(page: Page): Promise<CaptchaSolveHandle 
   const info = await detectCaptcha(page);
   if (!info) return null;
 
+  console.info(
+    `[captcha-solver] detected ${info.type}${info.isEnterprise ? " (enterprise)" : ""} on ${page.url()} — solving via 2captcha`,
+  );
+
   const websiteURL = page.url();
   const tokenPromise = solve(websiteURL, info).catch((err: unknown) => {
     console.warn("[captcha-solver] solve failed:", (err as Error).message ?? err);
@@ -287,12 +291,14 @@ export async function startCaptchaSolve(page: Page): Promise<CaptchaSolveHandle 
 /**
  * Awaits the token from startCaptchaSolve and injects it into the page.
  * Call this just before clicking the submit button.
+ * Returns true if a token was obtained and injected, false if solving
+ * timed out / failed (caller can use this to classify the outcome).
  */
 export async function injectCaptchaToken(
   page: Page,
   handle: CaptchaSolveHandle,
   maxWaitMs = 45_000,
-): Promise<void> {
+): Promise<boolean> {
   // 解決完了を待つが、1社あたりの処理時間 (3分) を食い潰さないよう上限を設ける。
   // 上限超過時はトークン無しで送信を試みる (CAPTCHA 必須サイトはどのみち失敗するが、
   // CAPTCHA 検出が誤判定だったページを無駄に何十秒もブロックしないため)。
@@ -300,6 +306,11 @@ export async function injectCaptchaToken(
     handle.tokenPromise,
     new Promise<string>((resolve) => setTimeout(() => resolve(""), maxWaitMs)),
   ]);
-  if (!token) return;
+  if (!token) {
+    console.warn(`[captcha-solver] no token for ${handle.info.type} (solve failed or timed out)`);
+    return false;
+  }
   await injectToken(page, handle.info, token);
+  console.info(`[captcha-solver] token injected for ${handle.info.type}`);
+  return true;
 }

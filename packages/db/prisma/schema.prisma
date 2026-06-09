@@ -9,7 +9,12 @@ generator client {
 
 datasource db {
   provider = "postgresql"
+  // 通常クエリはトランザクションプーラ (pgbouncer, port 6543) 経由。
   url      = env("DATABASE_URL")
+  // マイグレーションは advisory lock を使うため pgbouncer を経由できない。
+  // Supabase のセッションプーラ (port 5432, pgbouncer なし) を直結用に使う。
+  // (prisma migrate / db push のみが使用。通常の PrismaClient は DATABASE_URL を使う)
+  directUrl = env("DIRECT_URL")
 }
 
 enum CaseStatus {
@@ -52,6 +57,7 @@ enum DeliveryErrorType {
   FIELD_MISMATCH
   SUBMIT_FAILED
   VALIDATION_ERROR
+  CAPTCHA_FAILED
   BLACKLISTED
   NETWORK_ERROR
   UNKNOWN

@@ -25,6 +25,7 @@ export type SubmitResult = {
     | "FIELD_MISMATCH"
     | "SUBMIT_FAILED"
     | "VALIDATION_ERROR"
+    | "CAPTCHA_FAILED"
     | "NETWORK_ERROR"
     | "UNKNOWN";
   errorMessage?: string;
