@@ -143,13 +143,18 @@ async function gotoWithRetry(
   throw lastErr;
 }
 
-// SPA / 遅延描画フォーム対策: 入力欄 (または埋め込みフォームの iframe) が現れるまで待つ。
+// SPA / 遅延描画フォーム対策: <form> タグ (または入力欄・埋め込み iframe) が現れるまで待つ。
 // domcontentloaded 直後だと React/Vue 製フォームや kintone/formrun 等の埋め込みが未描画で
-// FORM_NOT_FOUND になっていたため、最大 maxMs まで描画を待ってから検出に進む。
+// FORM_NOT_FOUND になっていたため、最大 maxMs まで描画を待つ。さらに、描画を検知できた後も
+// 「サイト描画から約3秒後に <form> が出てくる」ケースに合わせて約3秒の猶予を置き、全項目が
+// 揃ってから検出に進む (埋め込み iframe が中身を読み込む時間にもなる)。
 async function waitForFormRender(page: Page, maxMs = 8_000): Promise<void> {
-  await page
-    .waitForFunction(
+  let detected = false;
+  try {
+    await page.waitForFunction(
       () => {
+        // <form> タグが出ていれば最優先で採用
+        if (document.querySelector("form")) return true;
         const top = document.querySelectorAll(
           "input:not([type=hidden]):not([type=submit]):not([type=button]), select, textarea",
         ).length;
@@ -158,10 +163,13 @@ async function waitForFormRender(page: Page, maxMs = 8_000): Promise<void> {
         return document.querySelectorAll('iframe[src^="http"]').length > 0;
       },
       { timeout: maxMs },
-    )
-    .catch(() => {});
-  // iframe がそのコンテンツを読み込む猶予
-  await page.waitForTimeout(500).catch(() => {});
+    );
+    detected = true;
+  } catch {
+    /* タイムアウト — フォームが出ないサイトもある */
+  }
+  // 描画検知後は約3秒待って <form>/全項目が揃うのを待つ (未検知時は短めに)。
+  await page.waitForTimeout(detected ? 3_000 : 800).catch(() => {});
 }
 
 // 埋め込みフォーム (form.run / kintoneapp / MovableType Form / Pardot 等) は本体が
@@ -361,6 +369,26 @@ async function getElementMeta(_page: Page, el: ElementHandle<Element>) {
       if (!labelText) {
         const w = e.closest("label");
         if (w?.textContent) labelText = w.textContent;
+      }
+      if (!labelText) {
+        // name/id/label[for] を持たない行ベースのフォーム (kintone 等) 対策。
+        // 「入力欄が1つだけの行コンテナ」を祖先に探し、その中のラベル要素を採用する。
+        let node: Element | null = e.parentElement;
+        for (let hop = 0; node && hop < 6 && !labelText; hop++) {
+          const inputCount = node.querySelectorAll(
+            "input:not([type=hidden]), select, textarea",
+          ).length;
+          if (inputCount <= 1) {
+            const lab = node.querySelector(
+              'label, [class*="label" i], [class*="title" i], [class*="ttl" i], [class*="head" i], dt, th',
+            );
+            if (lab && !lab.querySelector("input, select, textarea")) {
+              const t = (lab.textContent ?? "").replace(/[\s　]+/g, " ").trim();
+              if (t && t.length <= 40) labelText = t;
+            }
+          }
+          node = node.parentElement;
+        }
       }
       return {
         name: get("name"),
@@ -730,11 +758,19 @@ async function safeFill(
     }
   }
 
-  // 非表示要素フォールバック (Satori 等で隠し UI の裏に input が居るケース)
+  // 非表示要素フォールバック (Satori 等で隠し UI の裏に input が居るケース) や、
+  // React/Vue 等の制御コンポーネント (kintone 等) 対策。後者は value プロパティを
+  // 監視しているため、ネイティブの value setter 経由で設定して input を発火させる。
   try {
     await el.evaluate((node, val) => {
       const inp = node as HTMLInputElement | HTMLTextAreaElement;
-      inp.value = val;
+      const proto =
+        inp instanceof HTMLTextAreaElement
+          ? HTMLTextAreaElement.prototype
+          : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+      if (setter) setter.call(inp, val);
+      else inp.value = val;
       inp.dispatchEvent(new Event("input", { bubbles: true }));
       inp.dispatchEvent(new Event("change", { bubbles: true }));
       inp.dispatchEvent(new Event("blur", { bubbles: true }));
@@ -1961,7 +1997,7 @@ export async function extractFormSnapshot(
       if (tag === "input" && ["hidden", "submit", "button", "image", "reset"].includes(type))
         continue;
 
-      // ラベル算出 (label[for] → 親 label → 祖先の data-column)
+      // ラベル算出 (label[for] → 親 label → 祖先の data-column → 行コンテナ内のラベル要素)
       let label = "";
       const idAttr = el.getAttribute("id");
       if (idAttr) {
@@ -1975,6 +2011,28 @@ export async function extractFormSnapshot(
       if (!label) {
         const col = el.closest("[data-column]");
         if (col?.getAttribute("data-column")) label = col.getAttribute("data-column") ?? "";
+      }
+      if (!label) {
+        // name/id/label[for] を持たないフォーム (kintone 等) 対策。入力欄の祖先を数階層
+        // たどり「この欄専用の行 (入力欄が1つだけのコンテナ)」を見つけ、その中の
+        // ラベルらしい要素 (label / class に label・title・ttl・head を含む / dt / th) の
+        // テキストをラベルとして採用する。
+        let node: Element | null = el.parentElement;
+        for (let hop = 0; node && hop < 6 && !label; hop++) {
+          const inputCount = node.querySelectorAll(
+            "input:not([type=hidden]), select, textarea",
+          ).length;
+          if (inputCount <= 1) {
+            const lab = node.querySelector(
+              'label, [class*="label" i], [class*="title" i], [class*="ttl" i], [class*="head" i], dt, th',
+            );
+            if (lab && !lab.querySelector("input, select, textarea")) {
+              const t = (lab.textContent ?? "").replace(/[\s　]+/g, " ").trim();
+              if (t && t.length <= 40) label = t;
+            }
+          }
+          node = node.parentElement;
+        }
       }
 
       let options: { value: string; text: string }[] | undefined;
