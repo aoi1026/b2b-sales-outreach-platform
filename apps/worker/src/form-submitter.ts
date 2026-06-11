@@ -392,9 +392,11 @@ async function getElementMeta(_page: Page, el: ElementHandle<Element>) {
   try {
     raw = await el.evaluate((node): RawMeta => {
       const e = node as HTMLElement;
-      const get = (a: string) => e.getAttribute(a) ?? "";
+      // 注: page.evaluate 内では名前付き内部関数を使わない (esbuild keepNames が __name を
+      //     挿入し、ブラウザ側で "__name is not defined" になり meta 取得が全滅するため)。
+      //     getAttribute はインラインで呼ぶ。
       let labelText = "";
-      const idv = get("id");
+      const idv = e.getAttribute("id") || "";
       if (idv) {
         const l = document.querySelector(`label[for="${CSS.escape(idv)}"]`);
         if (l?.textContent) labelText = l.textContent;
@@ -406,31 +408,32 @@ async function getElementMeta(_page: Page, el: ElementHandle<Element>) {
       if (!labelText) {
         // name/id/label[for] を持たない行ベースのフォーム (kintone 等) 対策。
         // 「入力欄が1つだけの行コンテナ」を祖先に探し、その中のラベル要素を採用する。
-        let node: Element | null = e.parentElement;
-        for (let hop = 0; node && hop < 6 && !labelText; hop++) {
-          const inputCount = node.querySelectorAll(
+        // 注: evaluate の引数名 (node) と衝突しないよう別名 (anc) を使う。
+        let anc: Element | null = e.parentElement;
+        for (let hop = 0; anc && hop < 6 && !labelText; hop++) {
+          const inputCount = anc.querySelectorAll(
             "input:not([type=hidden]), select, textarea",
           ).length;
           if (inputCount <= 1) {
-            const lab = node.querySelector(
-              'label, [class*="label" i], [class*="title" i], [class*="ttl" i], [class*="head" i], dt, th',
+            const lab = anc.querySelector(
+              'label, [class*="label"], [class*="title"], [class*="ttl"], [class*="head"], dt, th',
             );
             if (lab && !lab.querySelector("input, select, textarea")) {
-              const t = (lab.textContent ?? "").replace(/[\s　]+/g, " ").trim();
+              const t = (lab.textContent || "").replace(/[\s　]+/g, " ").trim();
               if (t && t.length <= 40) labelText = t;
             }
           }
-          node = node.parentElement;
+          anc = anc.parentElement;
         }
       }
       return {
-        name: get("name"),
+        name: e.getAttribute("name") || "",
         id: idv,
-        placeholder: get("placeholder"),
-        type: get("type").toLowerCase(),
+        placeholder: e.getAttribute("placeholder") || "",
+        type: (e.getAttribute("type") || "").toLowerCase(),
         required: e.hasAttribute("required"),
-        autocomplete: get("autocomplete").toLowerCase(),
-        dataColumn: get("data-column"),
+        autocomplete: (e.getAttribute("autocomplete") || "").toLowerCase(),
+        dataColumn: e.getAttribute("data-column") || "",
         tagName: e.tagName.toLowerCase(),
         labelText,
       };
