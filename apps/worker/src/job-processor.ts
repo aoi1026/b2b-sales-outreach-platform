@@ -82,6 +82,29 @@ async function recordRecipeOutcome(
   }
 }
 
+// 半角 ASCII/スペースを全角へ変換 (バリデーション失敗時の適応リトライ用)。
+function fw(s: string | null | undefined): string | null | undefined {
+  if (s == null) return s;
+  return s.replace(/[!-~]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 0xfee0)).replace(/ /g, "　");
+}
+// 氏名・会社名・住所などを全角化した入力を返す (メール/電話/郵便番号/URL/本文は除外)。
+// 「全角で入力してください」を要求するフォームで半角混入により弾かれたときの再試行に使う。
+function toFullWidthInput(inp: FormInput): FormInput {
+  return {
+    ...inp,
+    company: fw(inp.company) ?? null,
+    companyKana: fw(inp.companyKana) ?? null,
+    person: fw(inp.person) ?? null,
+    personHiragana: fw(inp.personHiragana) ?? null,
+    personKatakana: fw(inp.personKatakana) ?? null,
+    personKana: fw(inp.personKana) ?? null,
+    personLast: fw(inp.personLast) ?? null,
+    personFirst: fw(inp.personFirst) ?? null,
+    address: fw(inp.address) ?? null,
+    position: fw(inp.position) ?? null,
+  };
+}
+
 function applyVars(text: string, companyName: string): string {
   return text
     .replace(/\{\{\s*会社名\s*\}\}/g, companyName)
@@ -272,6 +295,10 @@ export async function processDeliveryJob(
         errorType: "UNKNOWN",
         errorMessage: "未実行",
       };
+      // 適応リトライ: 直前の失敗原因に応じて次回の入力を変える。
+      //  - VALIDATION_ERROR → 全角必須欄での半角混入が疑われるため、氏名/会社/住所を全角化。
+      let current = attemptInput;
+      let fullWidthTried = false;
       for (let i = 0; i < maxAttempts; i++) {
         if (outOfTime()) break;
         attempts++;
@@ -279,7 +306,7 @@ export async function processDeliveryJob(
           ? join(screenshotDir, `${sanitizeName(company.name)}_${labelSuffix}${i + 1}.png`)
           : undefined;
         try {
-          last = await submitForm(company.formUrl, attemptInput, {
+          last = await submitForm(company.formUrl, current, {
             screenshotPath,
             timeoutMs: remainingMs(),
           });
@@ -290,6 +317,11 @@ export async function processDeliveryJob(
             errorType: "UNKNOWN",
             errorMessage: (e as Error).message,
           };
+        }
+        // バリデーション失敗なら、次回は全角化した入力で再試行 (一度だけ)。
+        if (last.errorType === "VALIDATION_ERROR" && !fullWidthTried && i + 1 < maxAttempts) {
+          current = toFullWidthInput(current);
+          fullWidthTried = true;
         }
       }
       return { attempts, result: last };

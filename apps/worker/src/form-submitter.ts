@@ -79,7 +79,9 @@ type FieldRole =
   | "person_hiragana_first"
   | null;
 
-const NAV_TIMEOUT = 30_000;
+// 住宅プロキシ経由だと重いフォームページ (iframe埋め込み/SPA) の読み込みに時間がかかり、
+// 30秒では足りず TIMEOUT/FORM_NOT_FOUND になることがあるため余裕を持たせる。
+const NAV_TIMEOUT = 45_000;
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 MVPBusinessMessage/0.1";
 
