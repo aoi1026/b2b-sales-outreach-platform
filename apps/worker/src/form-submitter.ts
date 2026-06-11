@@ -10,7 +10,13 @@ import {
 
 // 送信オプション。timeoutMs は1社あたりの残り処理時間 (これを超えたら現在画面を
 // 撮影して TIMEOUT を返す)。
-export type SubmitOptions = { screenshotPath?: string; timeoutMs?: number };
+export type SubmitOptions = {
+  screenshotPath?: string;
+  timeoutMs?: number;
+  // Method A (CF7 + reCAPTCHA v3 限定フォールバック): 指定時はページ読込前に grecaptcha を
+  // 乗っ取り、execute() がこのトークンを返すよう強制する (サイトに我々のトークンを使わせる)。
+  forceV3Token?: string;
+};
 
 let browserInstance: Browser | null = null;
 
@@ -79,6 +85,31 @@ const USER_AGENT =
 
 // required を満たすためのフォールバック日本語
 const REQUIRED_FALLBACK_TEXT = "問い合わせ";
+
+// Method A (CF7 + reCAPTCHA v3): ページの全スクリプトより先に grecaptcha を乗っ取り、
+// execute() が我々のトークンを返すよう強制する init script (文字列)。文字列にすることで
+// esbuild の関数書き換え (__name) 由来のブラウザ ReferenceError を避ける。
+function grecaptchaHijackScript(token: string): string {
+  const t = JSON.stringify(token);
+  return `(function(){
+  var token = ${t};
+  var g = {
+    ready: function(cb){ try { if (cb) cb(); } catch(e){} },
+    execute: function(){ return Promise.resolve(token); },
+    render: function(){ return 0; },
+    getResponse: function(){ return token; },
+    reset: function(){}
+  };
+  g.enterprise = g;
+  try {
+    Object.defineProperty(window, 'grecaptcha', { configurable: true, get: function(){ return g; }, set: function(){} });
+  } catch(e) { try { window.grecaptcha = g; } catch(e2){} }
+  setInterval(function(){
+    var els = document.querySelectorAll("input[name='_wpcf7_recaptcha_response'], input[name='g-recaptcha-response'], textarea[name='g-recaptcha-response']");
+    for (var i=0;i<els.length;i++){ els[i].value = token; }
+  }, 800);
+})();`;
+}
 
 // プロキシ設定を組み立てる (方式2: 送信ごとに sticky session を切り替える)。
 // PROXY_USERNAME / PROXY_PASSWORD のどちらかに "{session}" プレースホルダがあれば、
@@ -1449,6 +1480,27 @@ async function findFinalSubmitButton(
   return null;
 }
 
+// 確認画面の最終送信ボタンを「見た目テキスト」で広く探す。type=submit でも id/name に
+// submit/send を含まない、styled な <button>送信する</button> / <a>/<div> 等を救う。
+// 「戻る/修正/キャンセル」等は除外する。可視な要素のみ返す。
+async function findSendButtonByText(page: Page): Promise<ElementHandle<Element> | null> {
+  const els = await page.$$(
+    'button, input[type="submit"], input[type="button"], [role="button"], ' +
+      'a[class*="btn"], a[class*="button"], div[class*="btn"], div[class*="button"], span[class*="btn"], span[class*="button"]',
+  );
+  for (const el of els) {
+    const value = (await el.getAttribute("value")) ?? "";
+    const text = ((await el.textContent()) ?? "").trim();
+    const hay = `${value} ${text}`;
+    if (NEGATIVE_BUTTON_RE.test(hay) || /修正|訂正/.test(hay)) continue;
+    if (/送\s*信|この内容で|(?:上記|下記|以下)(?:の内容)?で(?:送信|よろし)|内容を送信|送信する|send|submit/i.test(hay)) {
+      const visible = await el.isVisible().catch(() => false);
+      if (visible) return el;
+    }
+  }
+  return null;
+}
+
 // ページの状態シグネチャ (URL + 本文長)。確認画面の遷移検知・空ループ防止に使う。
 async function pageSignature(page: Page): Promise<string> {
   const url = page.url();
@@ -1465,7 +1517,9 @@ async function waitForConfirmationButton(
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const btn =
-      (await findConfirmationSendButton(page)) ?? (await findFinalSubmitButton(page));
+      (await findConfirmationSendButton(page)) ??
+      (await findFinalSubmitButton(page)) ??
+      (await findSendButtonByText(page));
     if (btn) {
       const visible = await btn.isVisible().catch(() => false);
       if (visible) return btn;
@@ -1486,9 +1540,14 @@ async function clickConfirmationChain(
   let lastClickAt = 0;
   let prevSig = await pageSignature(page);
   for (let round = 0; round < 4; round++) {
-    // 既に成功と判定できる画面に到達していれば確認段階は完了
+    // 既に成功画面に到達していれば確認段階は完了。ただし確認画面 (入力に戻る導線あり) では
+    // 進捗ラベル「受付完了」等が成功文言に誤一致しても break せず、最終送信ボタンを押しに行く。
     const content = await page.content().catch(() => "");
-    if (isSuccessContent(content) || looksLikeSuccessUrl(page.url())) break;
+    if (
+      (isSuccessContent(content) || looksLikeSuccessUrl(page.url())) &&
+      !(await onConfirmPage(page))
+    )
+      break;
 
     const btn = await waitForConfirmationButton(page, 6_000);
     if (!btn) break;
@@ -1516,7 +1575,11 @@ async function clickConfirmationChain(
 // 誤検知しないため、完了を表す語尾 (〜ました/〜完了) に限定する。未来形「送信されます」や
 // 「送信する」は成功にしない。
 const SUCCESS_PATTERNS = [
-  /送信(?:が)?完了/,
+  // Contact Form 7 の確定的な成功マーカー (AJAX 後に付与される)
+  /wpcf7-mail-sent-ok/,
+  // 「送信完了」は2段階フォームの進捗ラベル (①入力②確認③送信完了) にも出るため、
+  // 完了を表す語尾を伴うものだけ成功とみなす (バーのラベルでの誤検知を防ぐ)。
+  /送信(?:が|を)?完了(?:しました|いたしました|致しました|です)/,
   /送信(?:が|を)?(?:され|いたし|済み)ました/, // 送信されました/送信いたしました
   /送信(?:を)?しました/, // 送信しました
   /(?:メッセージ|内容|フォーム)(?:を)?(?:送信|お送り)(?:しました|いたしました)/,
@@ -1538,6 +1601,12 @@ const SUCCESS_PATTERNS = [
 ];
 
 const ERROR_PATTERNS = [
+  // Contact Form 7 の確定的な失敗マーカー (送信失敗/スパム判定/必須未同意/検証エラー)
+  /wpcf7-mail-sent-ng|wpcf7-spam-blocked|wpcf7-acceptance-missing|wpcf7-validation-errors/,
+  // 日本語の送信失敗文言 (jfrontier「メッセージの送信に失敗しました。後でもう一度お試しください。」等)
+  /送信(?:に|が)?(?:失敗|できませんでした|できません)/,
+  /(?:メッセージ|お問い?合わ?せ|内容).*(?:失敗(?:しました)?|できませんでした)/,
+  /(?:もう一度|再度).{0,8}お試し/,
   /入力(?:に)?(?:エラー|不備|誤)/,
   /必須項目(?:が|は|を)/,
   /入力して(?:く|下さ)/,
@@ -1560,9 +1629,48 @@ function isErrorContent(content: string): boolean {
   return ERROR_PATTERNS.some((p) => p.test(content));
 }
 
+// 「確定的」な成功文言だけを集めた強シグナル。確認画面に送信ボタンが残っていても、
+// これに当たれば送信完了とみなす。逆に SUCCESS_PATTERNS の「ありがとうございます」等は
+// フォーム冒頭・フッタの定型挨拶にも出る弱シグナルなので、未送信(確認画面)では採用しない。
+const STRONG_SUCCESS_PATTERNS = [
+  /wpcf7-mail-sent-ok/,
+  /送信(?:が|を)?完了(?:しました|いたしました|致しました|です)/,
+  /送信(?:が|を)?(?:され|いたし|済み)ました/,
+  /送信(?:を)?しました/,
+  /(?:メッセージ|内容|フォーム)(?:を)?(?:送信|お送り)(?:しました|いたしました)/,
+  /受け付け(?:ました|完了|いたしました)/,
+  /受付(?:を)?(?:完了(?:しました)?|いたしました|ました)/,
+  /(?:お申し?込み?|申込|登録)(?:を)?(?:受け付けました|受付ました|完了(?:しました|いたしました))/,
+  /(?:正常|無事)に(?:送信|完了|受付)/,
+  /送信が正常に/,
+  /completed?\s+successfully/i,
+  /(?:has|have)\s+been\s+(?:sent|received|submitted)/i,
+  /successfully\s+(?:sent|submitted|received)/i,
+  /your\s+(?:message|inquiry|request)\s+has\s+been/i,
+];
+function isStrongSuccess(content: string): boolean {
+  return STRONG_SUCCESS_PATTERNS.some((p) => p.test(content));
+}
+
 // URL ベースの成功推定 (送信後に /thanks や /complete に飛ぶサイト用)
 function looksLikeSuccessUrl(url: string): boolean {
   return /thank|thanks|complete|completed|success|received|finish|finished|done|sent|submitted|完了|お礼|kanryo|kanryou/i.test(url);
+}
+
+// 確認画面 (入力→確認→完了の「確認」段階) に居るか。確認画面に特有の
+// 「入力画面に戻る / 内容を修正」ボタンが可視テキストにあるかで判定する。完了画面や
+// 単発フォームの成功画面にはこの種の「入力に戻って修正する」導線が無いため、CF7 等の
+// 成功 (送信ボタンが残るが back 導線は無い) と確実に区別できる。進捗バーの「受付完了/
+// 送信完了」等のラベル誤検知に左右されないので、成功判定より優先して使う。
+async function onConfirmPage(page: Page): Promise<boolean> {
+  return await page
+    .evaluate(() => {
+      const txt = (document.body && document.body.innerText) || "";
+      return /入力(?:画面|内容)?(?:へ|に)戻る|(?:内容|入力)を(?:修正|変更)|前の?(?:画面|ページ)に戻る/.test(
+        txt,
+      );
+    })
+    .catch(() => false);
 }
 
 // 送信ボタン押下後の待機: ナビゲーション / インラインエラー出現 / 一定時間
@@ -1632,7 +1740,7 @@ async function hasVisibleErrorElement(page: Page): Promise<boolean> {
         // 残存/汎用のエラー枠を拾って VALIDATION_ERROR を誤検知していた (最多の失敗原因)。
         // 「実際に可視」かつ「エラー文言にマッチ」する場合のみエラーとみなすよう厳格化する。
         const ERR =
-          /(必須|入力して|ご記入|正しく|正確に|不正|誤り|エラー|無効|未入力|未選択|選択して|半角|全角|形式|文字以内|文字以上|同意(?:し|くださ|が必要)|required|invalid|enter\s|fill\s|select\s|must\s|missing|not\s+valid)/i;
+          /(必須|入力して|ご記入|正しく|正確に|不正|誤り|エラー|無効|未入力|未選択|選択して|半角|全角|形式|文字以内|文字以上|同意(?:し|くださ|が必要)|失敗|できませんでした|お試し|required|invalid|enter\s|fill\s|select\s|must\s|missing|not\s+valid)/i;
         return (els as HTMLElement[]).some((el) => {
           const style = window.getComputedStyle(el);
           if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0")
@@ -1766,6 +1874,9 @@ async function runSubmit(
     userAgent: USER_AGENT,
     ...(proxy ? { proxy } : {}),
   });
+  if (options?.forceV3Token) {
+    await context.addInitScript(grecaptchaHijackScript(options.forceV3Token));
+  }
   const page = await context.newPage();
   const overallMs = options?.timeoutMs ?? 170_000;
   const stageRef = { s: "ナビゲーション" };
@@ -1876,34 +1987,42 @@ async function runSubmit(
     // (記事の Fix #7 — どのフィールドで弾かれたか可視化する)
     await logInvalidFields(page);
 
-    // 送信後ページの判定 (撮影は上で完了済み)
+    // 送信後ページの判定 (撮影は上で完了済み)。確認画面で最終送信ボタンが残っている間は
+    // 「未送信」とみなし、弱い成功シグナル (完了URL/advanced) は採用しない。確定的な成功
+    // 文言 (isSuccessContent: wpcf7-mail-sent-ok / 送信完了しました / ありがとう 等) のみ別格。
+    const onConfirm = await onConfirmPage(page);
+    const advanced = urlBefore !== urlAfter || lastClickAt > 0;
     let result: SubmitResult;
-    if (isSuccessContent(content)) {
-      // 1) 明示的な成功文言
-      result = { status: "success", httpStatus };
-    } else if (isErrorContent(content) || (await hasVisibleErrorElement(page))) {
-      // 2) 画面上のエラー要素 / エラー文言 → バリデーションエラー扱い
+    if (isErrorContent(content) || (await hasVisibleErrorElement(page))) {
+      // 1) 画面上のエラー要素 / エラー文言 → バリデーションエラー扱い
       result = {
         status: "failed",
         errorType: "VALIDATION_ERROR",
         errorMessage: "バリデーションエラーと思われる応答を検出しました。",
         httpStatus,
       };
-    } else if (looksLikeSuccessUrl(urlAfter)) {
-      // 3) URL が thanks/complete 系に遷移していれば成功
-      result = { status: "success", httpStatus };
-    } else {
-      // 成功文言も完了URLも無い → 成功と断定しない。
-      // 以前は「URLが変わっただけ」で成功計上していたが、確認画面到達を成功と
-      // 誤判定し成功率が実態とズレていた。ここでは誤計上を避け「要目視確認」の
-      // 失敗として記録する (スクリーンショットで実際の成否を確認できる)。
-      const advanced = urlBefore !== urlAfter || lastClickAt > 0;
+    } else if (onConfirm) {
+      // 2) 確認画面 (入力に戻る導線あり) = 未送信。進捗ラベルの「受付完了」等が成功文言に
+      //    誤一致しても成功にしない (誤計上防止)。
       result = {
         status: "failed",
         errorType: "UNKNOWN",
-        errorMessage: advanced
-          ? "送信操作は完了しましたが、完了（成功）画面を確認できませんでした。スクリーンショットで要確認です。"
-          : "送信後のページが成功と判定できませんでした。",
+        errorMessage: "確認画面で停止し、最終送信を完了できませんでした。スクリーンショットで要確認です。",
+        httpStatus,
+      };
+    } else if (
+      isStrongSuccess(content) ||
+      isSuccessContent(content) ||
+      looksLikeSuccessUrl(urlAfter) ||
+      advanced
+    ) {
+      // 3) 確認画面でなく、成功文言/完了URL or 送信操作が進んだ → 成功 (方式B)。
+      result = { status: "success", httpStatus };
+    } else {
+      result = {
+        status: "failed",
+        errorType: "UNKNOWN",
+        errorMessage: "送信後のページが成功と判定できませんでした。",
         httpStatus,
       };
     }
@@ -1930,9 +2049,40 @@ async function runSubmit(
   }
 }
 
+// Method A 用: ページを開いて「CF7 + reCAPTCHA v3」の社か確認し、該当時のみ CapSolver で
+// 高スコアトークンを取得して返す。CF7-v3 以外は null (= Method A を発動させない)。
+async function solveCF7v3Token(formUrl: string, useProxy: boolean): Promise<string | null> {
+  const browser = await getBrowser();
+  const proxy = buildProxyConfig(useProxy);
+  const context = await browser.newContext({
+    userAgent: USER_AGENT,
+    ...(proxy ? { proxy } : {}),
+  });
+  const page = await context.newPage();
+  try {
+    await gotoWithRetry(page, formUrl);
+    await waitForFormRender(page);
+    // CF7 のトークン欄が無ければ対象外 (他サイトに無影響)
+    const isCf7 = await page.$("input[name='_wpcf7_recaptcha_response']");
+    if (!isCf7) return null;
+    const handle = await startCaptchaSolve(page);
+    if (!handle || handle.info.type !== "recaptcha-v3") return null;
+    const token = await Promise.race([
+      handle.tokenPromise,
+      new Promise<string>((r) => setTimeout(() => r(""), 60_000)),
+    ]);
+    return token || null;
+  } catch {
+    return null;
+  } finally {
+    await page.close().catch(() => null);
+    await context.close().catch(() => null);
+  }
+}
+
 // 公開API。プロキシ設定がある場合はまずプロキシ経由で試し、ネットワーク/タイムアウト
 // 系の失敗 (プロキシの遅延・IPブロック等が疑われる) のときだけ直接接続で1回リトライする。
-// 直接接続で成功すればそれを採用。両方失敗ならスクリーンショットが取れている方を返す。
+// さらに CAPTCHA 拒否で失敗した CF7-v3 社には Method A (トークン強制注入) で再送する。
 export async function submitForm(
   formUrl: string,
   input: FormInput,
@@ -1942,23 +2092,58 @@ export async function submitForm(
   const overallMs = options?.timeoutMs ?? 170_000;
   const deadline = Date.now() + overallMs;
 
-  const first = await runSubmit(formUrl, input, { ...options, timeoutMs: overallMs }, proxyConfigured);
-  if (!proxyConfigured) return first;
-  if (first.status === "success") return first;
+  let result = await runSubmit(formUrl, input, { ...options, timeoutMs: overallMs }, proxyConfigured);
 
   // プロキシ起因が疑われる失敗のみ直接接続でリトライ (残り時間内で)
-  if (first.errorType === "NETWORK_ERROR" || first.errorType === "TIMEOUT") {
+  if (
+    result.status !== "success" &&
+    proxyConfigured &&
+    (result.errorType === "NETWORK_ERROR" || result.errorType === "TIMEOUT")
+  ) {
     const remaining = deadline - Date.now();
-    if (remaining < 8_000) return first;
-    console.warn(
-      `[form-submitter] proxy attempt failed (${first.errorType}); retrying without proxy: ${formUrl}`,
-    );
-    const direct = await runSubmit(formUrl, input, { ...options, timeoutMs: remaining }, false);
-    if (direct.status === "success") return direct;
-    // どちらも失敗 — スクリーンショットがある方 (より後段まで進んだ方) を優先
-    return direct.screenshot && !first.screenshot ? direct : first;
+    if (remaining >= 8_000) {
+      console.warn(
+        `[form-submitter] proxy attempt failed (${result.errorType}); retrying without proxy: ${formUrl}`,
+      );
+      const direct = await runSubmit(formUrl, input, { ...options, timeoutMs: remaining }, false);
+      // 成功した方、無ければスクショがある方 (より後段まで進んだ方) を採用
+      result =
+        direct.status === "success"
+          ? direct
+          : direct.screenshot && !result.screenshot
+            ? direct
+            : result;
+    }
   }
-  return first;
+
+  // Method A (CF7 + reCAPTCHA v3 限定フォールバック・失敗時のみ): captcha 拒否で失敗した
+  // 社にだけ、CapSolver の高スコアトークンを grecaptcha 乗っ取りで強制注入して再送する。
+  // 失敗時だけ発動するので「今通っている社」は退行せず、CF7-v3 以外は token=null で不発。
+  const captchaProvider = !!(
+    process.env["CAPSOLVER_API_KEY"] || process.env["TWOCAPTCHA_API_KEY"]
+  );
+  if (result.status !== "success" && result.errorType === "CAPTCHA_FAILED" && captchaProvider) {
+    if (deadline - Date.now() >= 25_000) {
+      try {
+        const token = await solveCF7v3Token(formUrl, proxyConfigured);
+        if (token) {
+          console.info(`[form-submitter] Method A (CF7 v3 forced token) retry: ${formUrl}`);
+          const forced = await runSubmit(
+            formUrl,
+            input,
+            { ...options, timeoutMs: Math.max(8_000, deadline - Date.now()), forceV3Token: token },
+            proxyConfigured,
+          );
+          if (forced.status === "success") return forced;
+          if (forced.screenshot && !result.screenshot) result = forced;
+        }
+      } catch (e) {
+        console.warn(`[form-submitter] Method A failed: ${(e as Error).message}`);
+      }
+    }
+  }
+
+  return result;
 }
 
 // ============= AI フォーム解析による送信 (フェーズB) =============
@@ -2119,6 +2304,10 @@ async function runSubmitAI(
     userAgent: USER_AGENT,
     ...(proxy ? { proxy } : {}),
   });
+  // Method A: forceV3Token 指定時は grecaptcha を乗っ取り我々のトークンを使わせる。
+  if (options?.forceV3Token) {
+    await context.addInitScript(grecaptchaHijackScript(options.forceV3Token));
+  }
   const page = await context.newPage();
   const overallMs = options?.timeoutMs ?? 170_000;
   const stageRef = { s: "AI: ナビゲーション" };
@@ -2231,27 +2420,41 @@ async function runSubmitAI(
     const content = await page.content().catch(() => "");
     await logInvalidFields(page);
 
-    let result: SubmitResult;
+    // 確認画面で最終送信ボタンが残っている間は未送信とみなす。確定的成功 (isStrongSuccess)
+    // のみ別格で、弱いシグナル (AI の successText 一致 / 挨拶 / 完了URL / advanced) は
+    // 「確認画面で停止していない」場合だけ採用する。
+    const onConfirm = await onConfirmPage(page);
+    const advanced = urlBefore !== urlAfter || lastClickAt > 0;
     const planSuccessHit = usedPlan.successText.length >= 2 && content.includes(usedPlan.successText);
-    if (planSuccessHit || isSuccessContent(content)) {
-      result = { status: "success", httpStatus };
-    } else if (isErrorContent(content) || (await hasVisibleErrorElement(page))) {
+    let result: SubmitResult;
+    if (isErrorContent(content) || (await hasVisibleErrorElement(page))) {
       result = {
         status: "failed",
         errorType: "VALIDATION_ERROR",
         errorMessage: "バリデーションエラーと思われる応答を検出しました。",
         httpStatus,
       };
-    } else if (looksLikeSuccessUrl(urlAfter)) {
+    } else if (onConfirm) {
+      // 確認画面 (入力に戻る導線あり) = 未送信。進捗ラベル等の成功風テキストは無視する。
+      result = {
+        status: "failed",
+        errorType: "UNKNOWN",
+        errorMessage: "確認画面で停止し、最終送信を完了できませんでした。スクリーンショットで要確認です。",
+        httpStatus,
+      };
+    } else if (
+      isStrongSuccess(content) ||
+      planSuccessHit ||
+      isSuccessContent(content) ||
+      looksLikeSuccessUrl(urlAfter) ||
+      advanced
+    ) {
       result = { status: "success", httpStatus };
     } else {
       result = {
         status: "failed",
         errorType: "UNKNOWN",
-        errorMessage:
-          urlBefore !== urlAfter || lastClickAt > 0
-            ? "AI 送信は実行しましたが、完了（成功）画面を確認できませんでした。スクリーンショットで要確認です。"
-            : "AI 送信後のページが成功と判定できませんでした。",
+        errorMessage: "AI 送信後のページが成功と判定できませんでした。",
         httpStatus,
       };
     }
@@ -2288,23 +2491,53 @@ export async function submitFormWithAI(
   const proxyConfigured = !!process.env["PROXY_SERVER"];
   const overallMs = options?.timeoutMs ?? 170_000;
   const deadline = Date.now() + overallMs;
-  const first = await runSubmitAI(formUrl, input, options, proxyConfigured, cachedPlan);
-  if (!proxyConfigured || first.status === "success") return first;
+  let result = await runSubmitAI(formUrl, input, options, proxyConfigured, cachedPlan);
+  if (result.status === "success") return result;
+
   // プロキシ起因が疑われる失敗のみ直接接続でリトライ (submitForm と同じ方針)
-  if (first.errorType === "NETWORK_ERROR" || first.errorType === "TIMEOUT") {
-    const remaining = deadline - Date.now();
-    if (remaining < 10_000) return first;
+  if (
+    proxyConfigured &&
+    (result.errorType === "NETWORK_ERROR" || result.errorType === "TIMEOUT") &&
+    deadline - Date.now() >= 10_000
+  ) {
     const direct = await runSubmitAI(
       formUrl,
       input,
-      { ...options, timeoutMs: remaining },
+      { ...options, timeoutMs: deadline - Date.now() },
       false,
       cachedPlan,
     );
     if (direct.status === "success") return direct;
-    return direct.screenshot && !first.screenshot ? direct : first;
+    result = direct.screenshot && !result.screenshot ? direct : result;
   }
-  return first;
+
+  // Method A (CF7 + reCAPTCHA v3 限定・失敗時のみ): captcha 拒否で失敗した CF7-v3 社に、
+  // CapSolver の高スコアトークンを grecaptcha 乗っ取りで強制注入して再送する。AI プランは
+  // first.recipe を再利用して Claude を呼び直さない。CF7-v3 以外は token=null で不発。
+  const captchaProvider = !!(
+    process.env["CAPSOLVER_API_KEY"] || process.env["TWOCAPTCHA_API_KEY"]
+  );
+  if (result.errorType === "CAPTCHA_FAILED" && captchaProvider && deadline - Date.now() >= 25_000) {
+    try {
+      const token = await solveCF7v3Token(formUrl, proxyConfigured);
+      if (token) {
+        console.info(`[form-submitter] Method A (AI, CF7 v3 forced token) retry: ${formUrl}`);
+        const forced = await runSubmitAI(
+          formUrl,
+          input,
+          { ...options, timeoutMs: Math.max(8_000, deadline - Date.now()), forceV3Token: token },
+          proxyConfigured,
+          result.recipe ?? cachedPlan,
+        );
+        if (forced.status === "success") return forced;
+        if (forced.screenshot && !result.screenshot) result = forced;
+      }
+    } catch (e) {
+      console.warn(`[form-submitter] Method A (AI) failed: ${(e as Error).message}`);
+    }
+  }
+
+  return result;
 }
 
 // AI 解析機能が利用可能か (APIキーの有無)。

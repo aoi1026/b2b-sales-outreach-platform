@@ -1,9 +1,77 @@
 import type { Page } from "playwright";
 
-const API_KEY = process.env["TWOCAPTCHA_API_KEY"];
-const BASE_URL = "https://api.2captcha.com";
-
+// CAPTCHA 解決プロバイダ。CAPSOLVER_API_KEY があれば CapSolver を優先 (v3/Turnstile の
+// スコアが高く成功率が良い)、無ければ TWOCAPTCHA_API_KEY で 2captcha を使う。
+// どちらの API も createTask/getTaskResult が clientKey + task 形式でほぼ共通。
 type CaptchaType = "recaptcha-v2" | "recaptcha-v3" | "turnstile";
+
+type Provider = {
+  name: string;
+  baseUrl: string;
+  clientKey: string;
+  // CAPTCHA 種別ごとに createTask 用の task オブジェクトを組み立てる (型名がベンダ差異)。
+  task: (websiteURL: string, info: CaptchaInfo) => Record<string, unknown>;
+};
+
+function selectProvider(): Provider | null {
+  const capsolver = process.env["CAPSOLVER_API_KEY"];
+  const twocaptcha = process.env["TWOCAPTCHA_API_KEY"];
+  if (capsolver) {
+    return {
+      name: "capsolver",
+      baseUrl: "https://api.capsolver.com",
+      clientKey: capsolver,
+      task: (websiteURL, info) => {
+        if (info.type === "recaptcha-v2")
+          return {
+            type: info.isEnterprise
+              ? "ReCaptchaV2EnterpriseTaskProxyLess"
+              : "ReCaptchaV2TaskProxyLess",
+            websiteURL,
+            websiteKey: info.siteKey,
+          };
+        if (info.type === "recaptcha-v3")
+          return {
+            type: info.isEnterprise
+              ? "ReCaptchaV3EnterpriseTaskProxyLess"
+              : "ReCaptchaV3TaskProxyLess",
+            websiteURL,
+            websiteKey: info.siteKey,
+            pageAction: info.pageAction ?? "submit",
+          };
+        return { type: "AntiTurnstileTaskProxyLess", websiteURL, websiteKey: info.siteKey };
+      },
+    };
+  }
+  if (twocaptcha) {
+    return {
+      name: "2captcha",
+      baseUrl: "https://api.2captcha.com",
+      clientKey: twocaptcha,
+      task: (websiteURL, info) => {
+        if (info.type === "recaptcha-v2")
+          return {
+            type: info.isEnterprise
+              ? "RecaptchaV2EnterpriseTaskProxyless"
+              : "RecaptchaV2TaskProxyless",
+            websiteURL,
+            websiteKey: info.siteKey,
+          };
+        if (info.type === "recaptcha-v3")
+          return {
+            type: "RecaptchaV3TaskProxyless",
+            websiteURL,
+            websiteKey: info.siteKey,
+            pageAction: info.pageAction ?? "submit",
+            minScore: 0.7,
+            isEnterprise: info.isEnterprise ?? false,
+          };
+        return { type: "TurnstileTaskProxyless", websiteURL, websiteKey: info.siteKey };
+      },
+    };
+  }
+  return null;
+}
 
 export type CaptchaInfo = {
   type: CaptchaType;
@@ -17,30 +85,34 @@ type CreateTaskResponse = {
   errorId: number;
   errorCode?: string;
   errorDescription?: string;
-  taskId?: number;
+  // 2captcha は数値、CapSolver は文字列(UUID)を返す
+  taskId?: string | number;
 };
 
 type TaskResultResponse = {
   errorId: number;
   errorCode?: string;
   errorDescription?: string;
-  status?: "processing" | "ready";
+  status?: "processing" | "ready" | "failed";
   solution?: {
     gRecaptchaResponse?: string;
     token?: string;
   };
 };
 
-async function createTask(task: Record<string, unknown>): Promise<number> {
-  const res = await fetch(`${BASE_URL}/createTask`, {
+async function createTask(
+  provider: Provider,
+  task: Record<string, unknown>,
+): Promise<string | number> {
+  const res = await fetch(`${provider.baseUrl}/createTask`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ clientKey: API_KEY, task }),
+    body: JSON.stringify({ clientKey: provider.clientKey, task }),
   });
   const data = (await res.json()) as CreateTaskResponse;
-  if (data.errorId !== 0 || !data.taskId) {
+  if (data.errorId !== 0 || data.taskId == null) {
     throw new Error(
-      `2captcha createTask failed: ${data.errorCode ?? ""} ${data.errorDescription ?? ""}`.trim(),
+      `${provider.name} createTask failed: ${data.errorCode ?? ""} ${data.errorDescription ?? ""}`.trim(),
     );
   }
   return data.taskId;
@@ -48,22 +120,25 @@ async function createTask(task: Record<string, unknown>): Promise<number> {
 
 const CAPTCHA_POLL_TIMEOUT_MS = 120_000; // 2 minutes max
 
-async function pollTaskResult(taskId: number): Promise<string> {
+async function pollTaskResult(provider: Provider, taskId: string | number): Promise<string> {
   const deadline = Date.now() + CAPTCHA_POLL_TIMEOUT_MS;
   for (;;) {
     await new Promise((r) => setTimeout(r, 5_000));
     if (Date.now() >= deadline) {
-      throw new Error(`2captcha polling timed out after ${CAPTCHA_POLL_TIMEOUT_MS / 1000}s (taskId=${taskId})`);
+      throw new Error(
+        `${provider.name} polling timed out after ${CAPTCHA_POLL_TIMEOUT_MS / 1000}s (taskId=${taskId})`,
+      );
     }
-    const res = await fetch(`${BASE_URL}/getTaskResult`, {
+    const res = await fetch(`${provider.baseUrl}/getTaskResult`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ clientKey: API_KEY, taskId }),
+      body: JSON.stringify({ clientKey: provider.clientKey, taskId }),
     });
     const data = (await res.json()) as TaskResultResponse;
-    if (data.errorId !== 0) {
+    // errorId だけでなく status="failed" でも即失敗にする (CapSolver はこちらで返すことがある)。
+    if (data.errorId !== 0 || data.status === "failed") {
       throw new Error(
-        `2captcha getTaskResult failed: ${data.errorCode ?? ""} ${data.errorDescription ?? ""}`.trim(),
+        `${provider.name} getTaskResult failed: ${data.errorCode ?? ""} ${data.errorDescription ?? ""}`.trim(),
       );
     }
     if (data.status === "ready") {
@@ -125,10 +200,15 @@ export async function detectCaptcha(page: Page): Promise<CaptchaInfo | null> {
       const isEnterprise = src.includes("/recaptcha/enterprise.js") || src.includes("/enterprise.js");
       const srcMatch = src.match(/[?&]render=([^&]+)/);
       if (srcMatch?.[1] && srcMatch[1] !== "explicit") {
+        // Contact Form 7 は action "contactform" を使う。検証時のアクション不一致を避ける。
+        const isCf7 =
+          !!document.querySelector("input[name='_wpcf7_recaptcha_response']") ||
+          typeof (window as unknown as { wpcf7_recaptcha?: unknown }).wpcf7_recaptcha !==
+            "undefined";
         return {
           type: "recaptcha-v3",
           siteKey: decodeURIComponent(srcMatch[1]),
-          pageAction: "submit",
+          pageAction: isCf7 ? "contactform" : "submit",
           isEnterprise,
         };
       }
@@ -179,37 +259,10 @@ export async function detectCaptcha(page: Page): Promise<CaptchaInfo | null> {
 }
 
 async function solve(websiteURL: string, info: CaptchaInfo): Promise<string> {
-  let taskId: number;
-
-  if (info.type === "recaptcha-v2") {
-    // Enterprise 版は専用タスク (RecaptchaV2EnterpriseTaskProxyless) が必要
-    taskId = await createTask({
-      type: info.isEnterprise
-        ? "RecaptchaV2EnterpriseTaskProxyless"
-        : "RecaptchaV2TaskProxyless",
-      websiteURL,
-      websiteKey: info.siteKey,
-    });
-  } else if (info.type === "recaptcha-v3") {
-    // Enterprise v3 は同じタスク型で isEnterprise: true を指定する
-    taskId = await createTask({
-      type: "RecaptchaV3TaskProxyless",
-      websiteURL,
-      websiteKey: info.siteKey,
-      pageAction: info.pageAction ?? "submit",
-      minScore: 0.7,
-      isEnterprise: info.isEnterprise ?? false,
-    });
-  } else {
-    // turnstile
-    taskId = await createTask({
-      type: "TurnstileTaskProxyless",
-      websiteURL,
-      websiteKey: info.siteKey,
-    });
-  }
-
-  return await pollTaskResult(taskId);
+  const provider = selectProvider();
+  if (!provider) throw new Error("no captcha provider configured");
+  const taskId = await createTask(provider, provider.task(websiteURL, info));
+  return await pollTaskResult(provider, taskId);
 }
 
 async function injectToken(page: Page, info: CaptchaInfo, token: string): Promise<void> {
@@ -242,7 +295,8 @@ async function injectToken(page: Page, info: CaptchaInfo, token: string): Promis
       // Override grecaptcha.execute so the site receives our pre-solved token
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const win = window as any;
-      // 通常版・Enterprise 版どちらの execute/ready も差し替える
+      // 通常版・Enterprise 版どちらの execute/ready も差し替える。サイトが送信時に
+      // execute() を呼び直しても必ず我々のトークンが返るようにする。
       for (const g of [win.grecaptcha, win.grecaptcha?.enterprise]) {
         if (!g) continue;
         g.execute = () => Promise.resolve(t);
@@ -251,13 +305,22 @@ async function injectToken(page: Page, info: CaptchaInfo, token: string): Promis
           g.ready = (cb: () => void) => cb();
         }
       }
-      // Fallback: set any hidden g-recaptcha-response field
-      const el = document.querySelector<HTMLInputElement | HTMLTextAreaElement>(
-        "input[name='g-recaptcha-response'], textarea[name='g-recaptcha-response']",
+      // トークンを格納し得る hidden フィールドを総当たりで設定する。
+      //  - g-recaptcha-response: 標準
+      //  - _wpcf7_recaptcha_response: Contact Form 7 (日本で最多) の v3 連携フィールド
+      //  - name に recaptcha/token/captcha を含む hidden 欄も保険で設定
+      // 注: page.evaluate 内では名前付き内部関数を使わない (esbuild keepNames の __name で
+      //     ブラウザ側 ReferenceError になるため)。for-of でインライン処理する。
+      const fields = document.querySelectorAll(
+        "input[name='g-recaptcha-response'], textarea[name='g-recaptcha-response'], " +
+          "input[name='_wpcf7_recaptcha_response'], " +
+          "input[name*='recaptcha' i][type='hidden'], input[name*='captcha' i][type='hidden']",
       );
-      if (el) {
-        el.value = t;
-        el.dispatchEvent(new Event("change", { bubbles: true }));
+      for (const el of Array.from(fields)) {
+        const f = el as HTMLInputElement | HTMLTextAreaElement;
+        f.value = t;
+        f.dispatchEvent(new Event("input", { bubbles: true }));
+        f.dispatchEvent(new Event("change", { bubbles: true }));
       }
     }, token);
     return;
@@ -292,19 +355,20 @@ export type CaptchaSolveHandle = {
 };
 
 /**
- * Detects any captcha on the page and starts solving it via 2captcha in the background.
+ * Detects any captcha on the page and starts solving it in the background.
  * Returns a handle to await later (via injectCaptchaToken), or null if:
- *   - TWOCAPTCHA_API_KEY is not set
+ *   - no captcha provider key (CAPSOLVER_API_KEY / TWOCAPTCHA_API_KEY) is set
  *   - no captcha is detected on the page
  */
 export async function startCaptchaSolve(page: Page): Promise<CaptchaSolveHandle | null> {
-  if (!API_KEY) return null;
+  const provider = selectProvider();
+  if (!provider) return null;
 
   const info = await detectCaptcha(page);
   if (!info) return null;
 
   console.info(
-    `[captcha-solver] detected ${info.type}${info.isEnterprise ? " (enterprise)" : ""} on ${page.url()} — solving via 2captcha`,
+    `[captcha-solver] detected ${info.type}${info.isEnterprise ? " (enterprise)" : ""} on ${page.url()} — solving via ${provider.name}`,
   );
 
   const websiteURL = page.url();
