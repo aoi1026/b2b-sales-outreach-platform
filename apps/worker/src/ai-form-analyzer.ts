@@ -4,7 +4,9 @@ import Anthropic from "@anthropic-ai/sdk";
 // どのボタンをどの順で押し、何をもって成功とするか）を生成する。
 // ANTHROPIC_API_KEY が無ければ無効 (null を返す)。
 
-const MODEL = "claude-opus-4-8";
+// フォーム項目→送信プランの生成は構造化抽出タスクで Opus は過剰。Haiku で十分かつ
+// コストは約 1/15。これにより少額のクレジットでも多数のフォームを処理できる。
+const MODEL = "claude-haiku-4-5-20251001";
 
 let client: Anthropic | null = null;
 function getClient(): Anthropic | null {
