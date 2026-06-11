@@ -535,10 +535,10 @@ export function detectFieldRole(meta: ElementMeta): FieldRole {
   {
     const ph = meta.placeholder; // 原文 (カタカナ/ひらがな判定のため小文字化しない)
     const partLast =
-      /(?:^|[_\-])last[_\-]?name|lastname|(?:^|[_\-])sei(?:[_\-]|$)|family[_\-]?name|surname|姓|myoji|苗字|名字/.test(idOrName) ||
+      /(?:^|[_\-])last[_\-]?name|lastname|(?:^|[_\-])sei(?:[_\-]|$)|name[_\-]?sei|family[_\-]?name|surname|姓|myoji|苗字|名字/.test(idOrName) ||
       /(?:^|[^ぁ-ゖ])せい(?:[^ぁ-ゖ]|$)|セイ|^\s*姓\s*$/.test(ph);
     const partFirst =
-      /(?:^|[_\-])first[_\-]?name|firstname|(?:^|[_\-])mei(?:[_\-]|$)|given[_\-]?name/.test(idOrName) ||
+      /(?:^|[_\-])first[_\-]?name|firstname|(?:^|[_\-])mei(?:[_\-]|$)|name[_\-]?mei|given[_\-]?name/.test(idOrName) ||
       /(?:^|[^ぁ-ゖ])めい(?:[^ぁ-ゖ]|$)|メイ|^\s*名\s*$/.test(ph);
     if (partLast || partFirst) {
       const hira =
