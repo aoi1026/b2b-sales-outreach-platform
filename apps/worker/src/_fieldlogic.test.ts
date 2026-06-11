@@ -62,11 +62,12 @@ function meta(opts: {
   const labelText = opts.labelText ?? "";
   const autocomplete = opts.autocomplete ?? "";
   const dataColumn = "";
+  const className = "";
   return {
-    name, id, placeholder, type, required: false, tagName, labelText, autocomplete, dataColumn,
+    name, id, placeholder, type, required: false, tagName, labelText, autocomplete, dataColumn, className,
     idLower: id.toLowerCase(),
     nameLower: name.toLowerCase(),
-    combined: [name, id, placeholder, labelText, dataColumn, type].join("|").toLowerCase(),
+    combined: [name, id, placeholder, labelText, dataColumn, type, className].join("|").toLowerCase(),
   };
 }
 

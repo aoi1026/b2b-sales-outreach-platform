@@ -33,3 +33,13 @@ export const RESULT_STATUS_BADGE: Record<DeliveryResultStatus, string> = {
   FAILED: "bg-red-100 text-red-700",
   SKIPPED: "bg-gray-200 text-gray-600",
 };
+
+// 暫定成功 (送信ボタンは押下したが完了を確認できなかった) は status=SUCCESS のまま
+// errorType=UNKNOWN を持つ。表示は「成功-」とし、バッジ色は通常の成功と全く同じにする。
+export function resultStatusLabel(
+  status: DeliveryResultStatus,
+  errorType?: string | null,
+): string {
+  if (status === "SUCCESS" && errorType === "UNKNOWN") return `${RESULT_STATUS_LABEL.SUCCESS}-`;
+  return RESULT_STATUS_LABEL[status];
+}

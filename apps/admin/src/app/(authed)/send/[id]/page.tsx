@@ -6,7 +6,7 @@ import {
   JOB_STATUS_BADGE,
   JOB_STATUS_LABEL,
   RESULT_STATUS_BADGE,
-  RESULT_STATUS_LABEL,
+  resultStatusLabel,
 } from "@/lib/delivery-status";
 import { pauseJobAction, resumeJobAction, cancelJobAction } from "../actions";
 import DeleteJobButton from "../DeleteJobButton";
@@ -227,7 +227,7 @@ export default async function SendJobDetailPage({
                 </td>
                 <td className="px-3 py-2">
                   <span className={`inline-block text-xs px-2 py-0.5 rounded ${RESULT_STATUS_BADGE[r.status]}`}>
-                    {RESULT_STATUS_LABEL[r.status]}
+                    {resultStatusLabel(r.status, r.errorType)}
                   </span>
                 </td>
                 <td className="px-3 py-2 text-xs text-gray-600 truncate max-w-[200px]">

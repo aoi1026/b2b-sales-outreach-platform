@@ -14,7 +14,7 @@ import type { DeliveryJobPayload, FormInput } from "./types.ts";
 const prisma = new PrismaClient();
 
 const INTER_COMPANY_DELAY_MS = 2000;
-const MAX_ATTEMPTS = 3;
+const MAX_ATTEMPTS = 4;
 // 1社あたりの全リトライ含む最大処理時間。これを超えると TIMEOUT 扱いで次社へ。
 const PER_COMPANY_TIMEOUT_MS = 180_000;
 // レシピがこの回数連続的に失敗したら無効化し、次回は Claude で作り直す。
@@ -442,6 +442,9 @@ export async function processDeliveryJob(
 
     if (finalResult?.status === "success") {
       successCount++;
+      // 暫定成功 (送信ボタンは押下したが完了未確認) は status=SUCCESS のまま errorType=UNKNOWN を
+      // 残し、管理画面で「成功-」と区別表示する。確定成功は errorType=null。
+      const unconfirmed = finalResult.errorType === "UNKNOWN";
       await prisma.deliveryResult.update({
         where: { jobId_companyId: { jobId, companyId: company.id } },
         data: {
@@ -449,8 +452,8 @@ export async function processDeliveryJob(
           attempts: attemptsUsed,
           attemptedAt: new Date(),
           httpStatus: finalResult.httpStatus ?? null,
-          errorType: null,
-          errorMessage: null,
+          errorType: unconfirmed ? "UNKNOWN" : null,
+          errorMessage: unconfirmed ? (finalResult.errorMessage ?? null) : null,
           screenshot: finalResult.screenshot ? new Uint8Array(finalResult.screenshot) : null,
         },
       });

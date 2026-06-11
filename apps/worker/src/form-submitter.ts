@@ -387,6 +387,7 @@ async function getElementMeta(_page: Page, el: ElementHandle<Element>) {
     dataColumn: string;
     tagName: string;
     labelText: string;
+    className: string;
   };
   let raw: RawMeta;
   try {
@@ -436,6 +437,7 @@ async function getElementMeta(_page: Page, el: ElementHandle<Element>) {
         dataColumn: e.getAttribute("data-column") || "",
         tagName: e.tagName.toLowerCase(),
         labelText,
+        className: e.getAttribute("class") || "",
       };
     });
   } catch {
@@ -450,9 +452,10 @@ async function getElementMeta(_page: Page, el: ElementHandle<Element>) {
       dataColumn: "",
       tagName: "",
       labelText: "",
+      className: "",
     };
   }
-  const { name, id, placeholder, type, required, tagName, labelText, autocomplete, dataColumn } =
+  const { name, id, placeholder, type, required, tagName, labelText, autocomplete, dataColumn, className } =
     raw;
 
   return {
@@ -465,9 +468,11 @@ async function getElementMeta(_page: Page, el: ElementHandle<Element>) {
     labelText,
     autocomplete,
     dataColumn,
+    className,
     idLower: id.toLowerCase(),
     nameLower: name.toLowerCase(),
-    combined: [name, id, placeholder, labelText, dataColumn, type].join("|").toLowerCase(),
+    // class も役割判定の手掛かりに含める (name/id/label/placeholder に加えて、ユーザー要件)。
+    combined: [name, id, placeholder, labelText, dataColumn, type, className].join("|").toLowerCase(),
   };
 }
 
@@ -595,16 +600,16 @@ export function detectFieldRole(meta: ElementMeta): FieldRole {
     return "email_confirm";
 
   // メール (entryMail1 等 — confirm でない方)
-  if (/email|e[_\-]?mail|^mail$|_mail|mail_|メール|entrymail/.test(idOrName)) return "email";
+  if (/email|e[_\-]?mail|^mail$|[_\-]mail|mail[_\-]|メール|entrymail/.test(idOrName)) return "email";
 
   // FAX
-  if (/^fax$|_fax|fax_/.test(idOrName)) return "fax";
+  if (/^fax$|[_\-]fax|fax[_\-]/.test(idOrName)) return "fax";
 
-  // 電話
-  if (/^tel$|_tel|tel_|phone|denwa|電話|telnumber|telno/.test(idOrName)) return "phone";
+  // 電話 (user-tel / user_tel どちらも)
+  if (/^tel$|[_\-]tel|tel[_\-]|phone|denwa|電話|telnumber|telno/.test(idOrName)) return "phone";
 
   // 郵便番号 (分割欄で埋まっていない場合の単一 input 用フォールバック)
-  if (/zip|postal|yubin|^post$|_post|郵便/.test(idOrName)) return "postal_code";
+  if (/zip|postal|yubin|^post$|[_\-]post|郵便/.test(idOrName)) return "postal_code";
 
   // URL / web
   if (/^url$|_url|url_|website|web_?site|home_?page|hp_?url/.test(idOrName)) return "url";
@@ -622,18 +627,18 @@ export function detectFieldRole(meta: ElementMeta): FieldRole {
     return "address";
 
   // 役職 (常に "担当者" 固定)
-  if (/^position$|_position|position_|yakushoku|役職|busho|部署|department|dept/.test(idOrName))
+  if (/^position$|[_\-]position|position[_\-]|yakushoku|役職|busho|部署|department|dept/.test(idOrName))
     return "position";
 
   // 件名
-  if (/^subject$|_subject|subject_|title|kenmei|件名|inquiry_type|inquiry_subject/.test(idOrName)) return "subject";
+  if (/^subject$|[_\-]subject|subject[_\-]|title|kenmei|件名|inquiry_type|inquiry_subject/.test(idOrName)) return "subject";
 
   // 本文 (id/name レベル)
-  if (/^message$|_message|message_|^content$|_content|content_|^inquiry$|inquiry_body|toiawase|お問い?合わ?せ|honbun|本文|comment|^body$|_body/.test(idOrName))
+  if (/^message$|[_\-]message|message[_\-]|^content$|[_\-]content|content[_\-]|^inquiry$|inquiry_body|toiawase|お問い?合わ?せ|honbun|本文|comment|^body$|[_\-]body/.test(idOrName))
     return "message";
 
-  // 氏名 (id/name レベル — name 属性は紛らわしいので最後の手段)
-  if (/^name$|_name|name_|shimei|氏名|お名前|tantousha|担当者/.test(idOrName))
+  // 氏名 (id/name レベル — name 属性は紛らわしいので最後の手段)。user-name / user_name 両対応。
+  if (/^name$|[_\-]name|name[_\-]|shimei|氏名|お名前|tantousha|担当者/.test(idOrName))
     return "person";
 
   // ====== ここまでで決まらなければ <label>/placeholder 等のヒューリスティック ======
@@ -2013,38 +2018,30 @@ async function runSubmit(
     // 「未送信」とみなし、弱い成功シグナル (完了URL/advanced) は採用しない。確定的な成功
     // 文言 (isSuccessContent: wpcf7-mail-sent-ok / 送信完了しました / ありがとう 等) のみ別格。
     const onConfirm = await onConfirmPage(page);
-    const advanced = urlBefore !== urlAfter || lastClickAt > 0;
+    // 確定的な成功 (確認画面でなく、成功文言/完了URLを検出) = 「成功」。
+    const confirmedSuccess =
+      !onConfirm &&
+      (isStrongSuccess(content) || isSuccessContent(content) || looksLikeSuccessUrl(urlAfter));
     let result: SubmitResult;
     if (isErrorContent(content) || (await hasVisibleErrorElement(page))) {
-      // 1) 画面上のエラー要素 / エラー文言 → バリデーションエラー扱い
+      // 1) 画面上のエラー要素 / エラー文言 → バリデーションエラー (失敗)
       result = {
         status: "failed",
         errorType: "VALIDATION_ERROR",
         errorMessage: "バリデーションエラーと思われる応答を検出しました。",
         httpStatus,
       };
-    } else if (onConfirm) {
-      // 2) 確認画面 (入力に戻る導線あり) = 未送信。進捗ラベルの「受付完了」等が成功文言に
-      //    誤一致しても成功にしない (誤計上防止)。
-      result = {
-        status: "failed",
-        errorType: "UNKNOWN",
-        errorMessage: "確認画面で停止し、最終送信を完了できませんでした。スクリーンショットで要確認です。",
-        httpStatus,
-      };
-    } else if (
-      isStrongSuccess(content) ||
-      isSuccessContent(content) ||
-      looksLikeSuccessUrl(urlAfter) ||
-      advanced
-    ) {
-      // 3) 確認画面でなく、成功文言/完了URL or 送信操作が進んだ → 成功 (方式B)。
+    } else if (confirmedSuccess) {
+      // 2) 確定成功 = 「成功」
       result = { status: "success", httpStatus };
     } else {
+      // 3) ユーザー要件: エラーは無いが完了を確認できない (確認画面停止含む) → 送信ボタンは
+      //    押下したので「暫定成功 (成功-)」として success 扱い。errorType=UNKNOWN を残し、
+      //    管理画面で「成功-」と区別表示する。
       result = {
-        status: "failed",
+        status: "success",
         errorType: "UNKNOWN",
-        errorMessage: "送信後のページが成功と判定できませんでした。",
+        errorMessage: "送信操作は完了しましたが、完了画面を確認できませんでした（暫定成功）。",
         httpStatus,
       };
     }
@@ -2448,8 +2445,13 @@ async function runSubmitAI(
     // のみ別格で、弱いシグナル (AI の successText 一致 / 挨拶 / 完了URL / advanced) は
     // 「確認画面で停止していない」場合だけ採用する。
     const onConfirm = await onConfirmPage(page);
-    const advanced = urlBefore !== urlAfter || lastClickAt > 0;
     const planSuccessHit = usedPlan.successText.length >= 2 && content.includes(usedPlan.successText);
+    const confirmedSuccess =
+      !onConfirm &&
+      (isStrongSuccess(content) ||
+        planSuccessHit ||
+        isSuccessContent(content) ||
+        looksLikeSuccessUrl(urlAfter));
     let result: SubmitResult;
     if (isErrorContent(content) || (await hasVisibleErrorElement(page))) {
       result = {
@@ -2458,27 +2460,14 @@ async function runSubmitAI(
         errorMessage: "バリデーションエラーと思われる応答を検出しました。",
         httpStatus,
       };
-    } else if (onConfirm) {
-      // 確認画面 (入力に戻る導線あり) = 未送信。進捗ラベル等の成功風テキストは無視する。
-      result = {
-        status: "failed",
-        errorType: "UNKNOWN",
-        errorMessage: "確認画面で停止し、最終送信を完了できませんでした。スクリーンショットで要確認です。",
-        httpStatus,
-      };
-    } else if (
-      isStrongSuccess(content) ||
-      planSuccessHit ||
-      isSuccessContent(content) ||
-      looksLikeSuccessUrl(urlAfter) ||
-      advanced
-    ) {
+    } else if (confirmedSuccess) {
       result = { status: "success", httpStatus };
     } else {
+      // ユーザー要件: エラーは無いが完了を確認できない → 送信ボタンは押下したので暫定成功 (成功-)。
       result = {
-        status: "failed",
+        status: "success",
         errorType: "UNKNOWN",
-        errorMessage: "AI 送信後のページが成功と判定できませんでした。",
+        errorMessage: "送信操作は完了しましたが、完了画面を確認できませんでした（暫定成功）。",
         httpStatus,
       };
     }
