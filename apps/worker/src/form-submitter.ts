@@ -2082,9 +2082,11 @@ async function solveCF7v3Token(formUrl: string, useProxy: boolean): Promise<stri
   }
 }
 
-// 公開API。プロキシ設定がある場合はまずプロキシ経由で試し、ネットワーク/タイムアウト
-// 系の失敗 (プロキシの遅延・IPブロック等が疑われる) のときだけ直接接続で1回リトライする。
-// さらに CAPTCHA 拒否で失敗した CF7-v3 社には Method A (トークン強制注入) で再送する。
+// 公開API。直接接続を優先する: 住宅プロキシは重い iframe/SPA フォームページの読み込みが
+// 遅く FORM_NOT_FOUND / TIMEOUT を多発させるため。直接で IPブロック (403/接続拒否
+// = NETWORK_ERROR) されたときだけプロキシ経由で再試行する。CAPTCHA は CapSolver が自身の
+// IP で解くため、直接接続でもスコアに不利は出ない。さらに CAPTCHA 拒否で失敗した CF7-v3 社
+// には Method A (トークン強制注入) で再送する。
 export async function submitForm(
   formUrl: string,
   input: FormInput,
@@ -2094,47 +2096,47 @@ export async function submitForm(
   const overallMs = options?.timeoutMs ?? 170_000;
   const deadline = Date.now() + overallMs;
 
-  let result = await runSubmit(formUrl, input, { ...options, timeoutMs: overallMs }, proxyConfigured);
+  // 1) まず直接接続 (高速・重いページも描画できる)
+  let result = await runSubmit(formUrl, input, { ...options, timeoutMs: overallMs }, false);
 
-  // プロキシ起因が疑われる失敗のみ直接接続でリトライ (残り時間内で)
+  // 2) 直接で IPブロックされた疑い (NETWORK_ERROR) のときだけプロキシで再試行
   if (
     result.status !== "success" &&
     proxyConfigured &&
-    (result.errorType === "NETWORK_ERROR" || result.errorType === "TIMEOUT")
+    result.errorType === "NETWORK_ERROR" &&
+    deadline - Date.now() >= 10_000
   ) {
-    const remaining = deadline - Date.now();
-    if (remaining >= 8_000) {
-      console.warn(
-        `[form-submitter] proxy attempt failed (${result.errorType}); retrying without proxy: ${formUrl}`,
-      );
-      const direct = await runSubmit(formUrl, input, { ...options, timeoutMs: remaining }, false);
-      // 成功した方、無ければスクショがある方 (より後段まで進んだ方) を採用
-      result =
-        direct.status === "success"
-          ? direct
-          : direct.screenshot && !result.screenshot
-            ? direct
-            : result;
-    }
+    console.warn(`[form-submitter] direct blocked (${result.errorType}); retrying via proxy: ${formUrl}`);
+    const viaProxy = await runSubmit(
+      formUrl,
+      input,
+      { ...options, timeoutMs: deadline - Date.now() },
+      true,
+    );
+    result =
+      viaProxy.status === "success"
+        ? viaProxy
+        : viaProxy.screenshot && !result.screenshot
+          ? viaProxy
+          : result;
   }
 
-  // Method A (CF7 + reCAPTCHA v3 限定フォールバック・失敗時のみ): captcha 拒否で失敗した
-  // 社にだけ、CapSolver の高スコアトークンを grecaptcha 乗っ取りで強制注入して再送する。
-  // 失敗時だけ発動するので「今通っている社」は退行せず、CF7-v3 以外は token=null で不発。
+  // 3) Method A (CF7 + reCAPTCHA v3 限定・失敗時のみ): CapSolver の高スコアトークンを
+  //    grecaptcha 乗っ取りで強制注入して再送 (直接接続)。CF7-v3 以外は token=null で不発。
   const captchaProvider = !!(
     process.env["CAPSOLVER_API_KEY"] || process.env["TWOCAPTCHA_API_KEY"]
   );
   if (result.status !== "success" && result.errorType === "CAPTCHA_FAILED" && captchaProvider) {
     if (deadline - Date.now() >= 25_000) {
       try {
-        const token = await solveCF7v3Token(formUrl, proxyConfigured);
+        const token = await solveCF7v3Token(formUrl, false);
         if (token) {
           console.info(`[form-submitter] Method A (CF7 v3 forced token) retry: ${formUrl}`);
           const forced = await runSubmit(
             formUrl,
             input,
             { ...options, timeoutMs: Math.max(8_000, deadline - Date.now()), forceV3Token: token },
-            proxyConfigured,
+            false,
           );
           if (forced.status === "success") return forced;
           if (forced.screenshot && !result.screenshot) result = forced;
@@ -2493,24 +2495,24 @@ export async function submitFormWithAI(
   const proxyConfigured = !!process.env["PROXY_SERVER"];
   const overallMs = options?.timeoutMs ?? 170_000;
   const deadline = Date.now() + overallMs;
-  let result = await runSubmitAI(formUrl, input, options, proxyConfigured, cachedPlan);
+  // submitForm と同方針: 直接接続を優先し、IPブロック (NETWORK_ERROR) のときだけプロキシ再試行。
+  let result = await runSubmitAI(formUrl, input, options, false, cachedPlan);
   if (result.status === "success") return result;
 
-  // プロキシ起因が疑われる失敗のみ直接接続でリトライ (submitForm と同じ方針)
   if (
     proxyConfigured &&
-    (result.errorType === "NETWORK_ERROR" || result.errorType === "TIMEOUT") &&
+    result.errorType === "NETWORK_ERROR" &&
     deadline - Date.now() >= 10_000
   ) {
-    const direct = await runSubmitAI(
+    const viaProxy = await runSubmitAI(
       formUrl,
       input,
       { ...options, timeoutMs: deadline - Date.now() },
-      false,
+      true,
       cachedPlan,
     );
-    if (direct.status === "success") return direct;
-    result = direct.screenshot && !result.screenshot ? direct : result;
+    if (viaProxy.status === "success") return viaProxy;
+    result = viaProxy.screenshot && !result.screenshot ? viaProxy : result;
   }
 
   // Method A (CF7 + reCAPTCHA v3 限定・失敗時のみ): captcha 拒否で失敗した CF7-v3 社に、
@@ -2521,14 +2523,14 @@ export async function submitFormWithAI(
   );
   if (result.errorType === "CAPTCHA_FAILED" && captchaProvider && deadline - Date.now() >= 25_000) {
     try {
-      const token = await solveCF7v3Token(formUrl, proxyConfigured);
+      const token = await solveCF7v3Token(formUrl, false);
       if (token) {
         console.info(`[form-submitter] Method A (AI, CF7 v3 forced token) retry: ${formUrl}`);
         const forced = await runSubmitAI(
           formUrl,
           input,
           { ...options, timeoutMs: Math.max(8_000, deadline - Date.now()), forceV3Token: token },
-          proxyConfigured,
+          false,
           result.recipe ?? cachedPlan,
         );
         if (forced.status === "success") return forced;
