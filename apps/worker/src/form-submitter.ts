@@ -543,7 +543,7 @@ export function detectFieldRole(meta: ElementMeta): FieldRole {
     if (partLast || partFirst) {
       const hira =
         /hira(?:gana)?|ひらがな/.test(idOrName) ||
-        /ひらがな/.test(combined) ||
+        /ひらがな|ふりがな/.test(combined) ||
         /(?:^|[^ぁ-ゖ])(?:せい|めい)(?:[^ぁ-ゖ]|$)/.test(ph);
       const kata =
         !hira &&
@@ -563,12 +563,13 @@ export function detectFieldRole(meta: ElementMeta): FieldRole {
     return "person_hiragana";
   }
 
-  // カタカナ・フリガナ (会社用と氏名用を区別)
-  if (/katakana|(?:furi)?gana|^kana$|_kana|kana_|フリガナ|フリ|カナ|カタカナ/.test(idOrName)) {
+  // カタカナ・フリガナ (会社用と氏名用を区別)。"namekana" のようにセパレータ無しで kana が
+  // 埋め込まれた名前も拾う (kana の直後が英小文字でない場合 = kanagawa 等の誤検知は避ける)。
+  if (/katakana|(?:furi)?gana|^kana$|_kana|kana_|kana(?![a-z])|フリガナ|フリ|カナ|カタカナ/.test(idOrName)) {
     if (/comp|coop|kaisha|company|corp|firm/.test(idOrName)) return "company_kana";
-    // combined に「ひらがな」が含まれていればひらがな扱いに切替 (akita-ya: id=kana だが
-    // ラベル/プレースホルダで「ひらがな」を要求するケース)
-    if (/ひらがな/.test(combined)) return "person_hiragana";
+    // ラベル/プレースホルダの表記で文字種を決める: 「ひらがな」「ふりがな」(ひらがな表記) は
+    // ひらがな、「フリガナ」(カタカナ表記) はカタカナ。
+    if (/ひらがな|ふりがな/.test(combined)) return "person_hiragana";
     return "person_kana";
   }
 
@@ -1115,16 +1116,32 @@ async function fillTextLikeFields(
   const elements = await form.$$("input, textarea");
   let filled = 0;
 
+  // パス1: 各要素の role を先に算出する。
+  type Item = { el: ElementHandle<Element>; meta: ElementMeta; role: FieldRole };
+  const items: Item[] = [];
   for (const el of elements) {
     const meta = await getElementMeta(page, el);
-
-    // <input> でテキスト系以外 (submit/checkbox/radio など) はここでは触らない
     if (meta.tagName === "input" && SKIP_INPUT_TYPES.has(meta.type)) continue;
-
-    // 既に分割グループ (tel×3 / zip×2) で埋め済みの name はスキップ
     if (meta.name && consumedNames.has(meta.name)) continue;
+    items.push({ el, meta, role: detectFieldRole(meta) });
+  }
 
-    const role = detectFieldRole(meta);
+  // パス1.5: 氏名欄が「姓/名」に分かれているのに両方とも氏名全体 (person 等) と判定された
+  // ケースを救う。同じ "全体名" role の欄がちょうど2つ並んでいたら、1つ目を姓・2つ目を名に
+  // 振り分ける (ユーザー要件: 2つの氏名欄には 白石 と 秀彦 を分けて入れる)。
+  const splitPair = (whole: FieldRole, last: FieldRole, first: FieldRole) => {
+    const idxs = items.map((it, i) => (it.role === whole ? i : -1)).filter((i) => i >= 0);
+    if (idxs.length === 2) {
+      items[idxs[0]!]!.role = last;
+      items[idxs[1]!]!.role = first;
+    }
+  };
+  splitPair("person", "person_last", "person_first");
+  splitPair("person_kana", "person_kana_last", "person_kana_first");
+  splitPair("person_hiragana", "person_hiragana_last", "person_hiragana_first");
+
+  // パス2: 充填する。
+  for (const { el, meta, role } of items) {
     let value = pickValueForRole(role, input);
 
     // role が決まらない & required 属性 → required を満たすデフォルトで埋める
