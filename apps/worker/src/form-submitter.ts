@@ -67,8 +67,10 @@ type FieldRole =
   | "company_kana"
   | "url"
   | "address"
+  | "address_pref"
   | "address_city"
   | "address_town"
+  | "address_building"
   | "person"
   | "person_kana"
   | "person_hiragana"
@@ -651,6 +653,18 @@ export function detectFieldRole(meta: ElementMeta): FieldRole {
 
   // ====== id/name の specific patterns (ユーザ要件) ======
 
+  // 会社名のフリガナ欄 (例: htm-consul の「貴社名フリガナ」)。フリガナ指標 + 会社ヒントが
+  // label/combined にあれば、氏名カナではなく company_kana として扱う (取り違え防止)。
+  {
+    const hay = `${idOrName}|${combined}`;
+    if (
+      /katakana|(?:furi)?gana|kana|フリガナ|フリ|カナ|カタカナ|ひらがな|ふりがな/.test(hay) &&
+      /会社|貴社|御社|法人|団体|company|corp|kaisha|coop|firm/i.test(hay)
+    ) {
+      return "company_kana";
+    }
+  }
+
   // ひらがな (id/name に hira/hiragana/ひらがな、または combined にひらがなヒント)
   if (/hira(?:gana)?|ひらがな/.test(idOrName) || /ひらがな|ふりがな/.test(combined)) {
     return "person_hiragana";
@@ -702,17 +716,17 @@ export function detectFieldRole(meta: ElementMeta): FieldRole {
   // URL / web
   if (/^url$|_url|url_|website|web_?site|home_?page|hp_?url/.test(idOrName)) return "url";
 
-  // 住所の細分化: city / town / address のいずれかを返す
-  // (akita-ya: id=city, id=town, id=pref / chushoku: name=住所)
-  if (/^city$|_city|city_|市区町村|市町村/.test(idOrName)) return "address_city";
-  if (/^town$|_town|town_|^street$|_street|street_|番地|町名/.test(idOrName))
+  // 住所の細分化: 都道府県 / 市区町村 / 番地 / 建物 / 結合住所 を区別する。
+  // 個別欄には送信元テンプレの該当コンポーネント値を入れる (結合文字列のスライスはしない)。
+  const addrHay = `${idOrName}|${combined}`;
+  if (/^pref$|_pref|prefecture|都道府県|address-?level1/.test(addrHay)) return "address_pref";
+  if (/^city$|_city|city_|市区町村|市町村|address-?level2/.test(addrHay)) return "address_city";
+  // 建物・ビル・部屋 (番地と一緒でない単独の建物欄)
+  if (/建物|ビル|マンション|号室|部屋|building|room/.test(addrHay) && !/番地|丁目|street/.test(addrHay))
+    return "address_building";
+  if (/^town$|_town|town_|^street$|_street|street_|番地|町名|丁目|address-?line/.test(addrHay))
     return "address_town";
-  if (
-    /^address$|_address|address_|^addr$|_addr|jusho|住所|prefecture|都道府県|^pref$|_pref|entryaddr/.test(
-      idOrName,
-    )
-  )
-    return "address";
+  if (/^address$|_address|address_|^addr$|_addr|jusho|住所|entryaddr/.test(idOrName)) return "address";
 
   // 部署 (役職より先に判定。専用値が無ければ役職へフォールバック)
   if (/busho|bumon|部署|部門|department|dept/.test(idOrName)) return "department";
@@ -762,6 +776,21 @@ function stripSpaces(s: string | null | undefined): string | null {
   return s.replace(/[\s　]+/g, "");
 }
 
+// 数字以外 (ハイフン/スペース/括弧等) を除去して数字のみにする。
+// 単一の電話番号欄・郵便番号欄はハイフンを除外して入力する (ユーザ要件)。
+function digitsOnly(s: string | null | undefined): string | null {
+  if (s == null) return null;
+  const d = s.replace(/[^0-9]/g, "");
+  return d.length > 0 ? d : null;
+}
+
+// 結合住所の先頭から都道府県を抽出する (個別の prefecture が無いとき用)。
+function extractPrefecture(addr: string | null | undefined): string | null {
+  if (!addr) return null;
+  const m = addr.match(/^\s*(東京都|北海道|(?:京都|大阪)府|.{2,3}県)/);
+  return m ? m[1] : null;
+}
+
 // 半角 ASCII (英数記号) と半角スペースを全角に変換する。
 // 「全角で入力してください」を要求するフォーム (krs.bz 等) で、半角スペースや
 // 半角記号が混じった住所などが弾かれるのを防ぐ。
@@ -801,12 +830,14 @@ export function pickValueForRole(role: FieldRole, input: FormInput): string | nu
       // 確認用メール欄: 必ず元のメールと同じ値を入れる (バリデーションで弾かれないため)
       return input.email ?? null;
     case "phone":
-      return input.phone ?? null;
+      // 単一の電話番号欄はハイフンを除外して数字のみで入力 (分割欄は別ロジックで「-」分割)。
+      return digitsOnly(input.phone);
     case "fax":
       // FAX 欄は専用値が無いので電話番号で代替 (空のままだと required で弾かれることがある)
-      return input.phone ?? null;
+      return digitsOnly(input.phone);
     case "postal_code":
-      return input.postalCode ?? null;
+      // 単一の郵便番号欄はハイフンを除外して数字のみ (分割欄は別ロジックで「-」2分割)。
+      return digitsOnly(input.postalCode);
     case "subject":
       return input.subject ?? null;
     case "message":
@@ -824,18 +855,28 @@ export function pickValueForRole(role: FieldRole, input: FormInput): string | nu
     case "url":
       return input.url ?? null;
     case "address":
-      // SenderTemplate.address があればそれを使う。無ければ郵便番号のみ等は使わない
-      // (中途半端な住所はバリデーションで弾かれるので空のまま)
-      return input.address ?? null;
+      // 単一住所欄: 結合住所をそのまま。無ければ個別欄から組み立てる。
+      return (
+        input.address ??
+        ([input.prefecture, input.city, input.addressLine, input.building]
+          .map((p) => p?.trim())
+          .filter(Boolean)
+          .join("") || null)
+      );
+    case "address_pref":
+      // 都道府県欄: 個別値を優先。無ければ結合住所の先頭から都道府県を推定。
+      return input.prefecture ?? extractPrefecture(input.address) ?? null;
     case "address_city":
-      // 「市区町村」相当: 住所文字列から都道府県を除いた頭の部分を使うのが理想だが、
-      // 厳密な分割は難しいので、address があれば最初の 10 文字程度を使う。
-      // 無ければ address そのまま (字数オーバーは reject されるリスクあり)。
-      return input.address ? input.address.slice(0, 16) : null;
+      // 市区町村欄: 個別値を優先 (機械的スライスはしない)。
+      return input.city ?? null;
     case "address_town":
-      // 「町名・番地」相当: address があれば 10 文字目以降。短ければ address そのまま。
-      if (!input.address) return null;
-      return input.address.length > 16 ? input.address.slice(16) : input.address;
+      // 丁目番地欄 (建物が別欄でないことが多いので建物も結合して入れる)。
+      return (
+        [input.addressLine, input.building].map((p) => p?.trim()).filter(Boolean).join(" ") || null
+      );
+    case "address_building":
+      // 建物・ビル・部屋欄。
+      return input.building ?? null;
     case "person":
       return input.person ?? null;
     case "person_kana":
@@ -2241,18 +2282,19 @@ async function runSubmit(
   }
 }
 
-// Method A 用: ページを開いて「CF7 + reCAPTCHA v3」の社か確認し、該当時のみ CapSolver で
-// 高スコアトークンを取得して返す。CF7-v3 以外は null (= Method A を発動させない)。
-async function solveCF7v3Token(formUrl: string, useProxy: boolean): Promise<string | null> {
+// Method A 用: ページを開いて reCAPTCHA v3 (CF7 に限らず一般サイトも対象) を検出し、
+// CapSolver でトークンを取得して返す。v3 以外 (v2 チェックボックス等) は null = Method A 不発。
+// v3 はサイトが送信時に grecaptcha.execute() を呼び直して「自動操作の低スコアトークン」を
+// 取得し直すため、通常の後付け注入では上書きされてしまう。Method A は init script で
+// grecaptcha を最初から乗っ取り、我々の高スコアトークンを必ず返すようにする (yamaha 等の対策)。
+async function solveV3ForcedToken(formUrl: string, useProxy: boolean): Promise<string | null> {
   const context = await createSubmitContext(useProxy);
   const page = await context.newPage();
   try {
     await gotoWithRetry(page, formUrl);
     await waitForFormRender(page);
-    // CF7 のトークン欄が無ければ対象外 (他サイトに無影響)
-    const isCf7 = await page.$("input[name='_wpcf7_recaptcha_response']");
-    if (!isCf7) return null;
     const handle = await startCaptchaSolve(page);
+    // reCAPTCHA v3 (invisible/スコア型) のみ Method A の対象。v2/Turnstile は通常注入で対応。
     if (!handle || handle.info.type !== "recaptcha-v3") return null;
     const token = await Promise.race([
       handle.tokenPromise,
@@ -2306,17 +2348,17 @@ export async function submitForm(
           : result;
   }
 
-  // 3) Method A (CF7 + reCAPTCHA v3 限定・失敗時のみ): CapSolver の高スコアトークンを
-  //    grecaptcha 乗っ取りで強制注入して再送 (直接接続)。CF7-v3 以外は token=null で不発。
+  // 3) Method A (reCAPTCHA v3 全般・失敗時のみ): CapSolver のトークンを grecaptcha 乗っ取りで
+  //    強制注入して再送 (直接接続)。v3 以外 (v2/Turnstile) は token=null で不発。
   const captchaProvider = !!(
     process.env["CAPSOLVER_API_KEY"] || process.env["TWOCAPTCHA_API_KEY"]
   );
   if (result.status !== "success" && result.errorType === "CAPTCHA_FAILED" && captchaProvider) {
     if (deadline - Date.now() >= 25_000) {
       try {
-        const token = await solveCF7v3Token(formUrl, false);
+        const token = await solveV3ForcedToken(formUrl, false);
         if (token) {
-          console.info(`[form-submitter] Method A (CF7 v3 forced token) retry: ${formUrl}`);
+          console.info(`[form-submitter] Method A (v3 forced token) retry: ${formUrl}`);
           const forced = await runSubmit(
             formUrl,
             input,
@@ -2347,6 +2389,10 @@ function inputToFillValues(input: FormInput) {
     phone: input.phone ?? null,
     postalCode: input.postalCode ?? null,
     address: input.address ?? null,
+    prefecture: input.prefecture ?? null,
+    city: input.city ?? null,
+    addressLine: input.addressLine ?? null,
+    building: input.building ?? null,
     url: input.url ?? null,
     subject: input.subject ?? null,
     message: input.message ?? null,
@@ -2711,9 +2757,9 @@ export async function submitFormWithAI(
   );
   if (result.errorType === "CAPTCHA_FAILED" && captchaProvider && deadline - Date.now() >= 25_000) {
     try {
-      const token = await solveCF7v3Token(formUrl, false);
+      const token = await solveV3ForcedToken(formUrl, false);
       if (token) {
-        console.info(`[form-submitter] Method A (AI, CF7 v3 forced token) retry: ${formUrl}`);
+        console.info(`[form-submitter] Method A (AI, v3 forced token) retry: ${formUrl}`);
         const forced = await runSubmitAI(
           formUrl,
           input,

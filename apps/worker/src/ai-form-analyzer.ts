@@ -49,6 +49,10 @@ export type FillValues = {
   phone?: string | null;
   postalCode?: string | null;
   address?: string | null;
+  prefecture?: string | null;
+  city?: string | null;
+  addressLine?: string | null;
+  building?: string | null;
   url?: string | null;
   subject?: string | null;
   message?: string | null;
@@ -121,6 +125,14 @@ const SYSTEM_PROMPT = `あなたは日本語のお問い合わせフォーム自
     「セイ/メイ」ならカタカナを要求している。フリガナ欄が姓/名に分かれている場合も
     上記と同様に分割する。
 - メールアドレス確認欄 (email2 / mail_confirm 等) には email と同じ値を fill する。
+- 電話番号・郵便番号の「ハイフン」は除外して入力する:
+  - 単一欄なら数字のみ (例: 電話 0368091657 / 郵便 1050021)。
+  - 電話が市外局番·市内局番·番号の3欄に分かれる場合は phone を「-」で3分割して順に入れる
+    (例: 03 / 6809 / 1657)。郵便が2欄なら postalCode を「-」で2分割 (例: 105 / 0021)。
+- 住所欄が「都道府県」「市区町村」「丁目番地」「ビル名・部屋番号」に分かれている場合は、
+  それぞれ prefecture / city / addressLine / building を対応させて入れる (結合 address を
+  そのまま1欄に詰め込まない)。単一の住所欄なら address を使う。「番地建物」のように番地と
+  建物が同じ欄なら addressLine + building を入れる。
 - 部署欄 (部署 / 部門 / department / busho) には department を fill する。department が無ければ position を使う。
   役職欄 (役職 / position / yakushoku) には position を fill する。部署と役職は別項目なので取り違えない。
 - 文字種の指定 (全角/半角) を守る。ラベルやプレースホルダ・スクリーンショットに「全角」と
@@ -153,7 +165,11 @@ function valuesToText(v: FillValues): string {
   push("メールアドレス (email)", v.email);
   push("電話番号 (phone)", v.phone);
   push("郵便番号 (postalCode)", v.postalCode);
-  push("住所 (address)", v.address);
+  push("住所·結合 (address)", v.address);
+  push("都道府県 (prefecture)", v.prefecture);
+  push("市区町村 (city)", v.city);
+  push("丁目番地 (addressLine)", v.addressLine);
+  push("ビル名·部屋 (building)", v.building);
   push("URL (url)", v.url);
   push("件名 (subject)", v.subject);
   push("本文 (message)", v.message);

@@ -289,6 +289,12 @@ export async function processDeliveryJob(
       phone: st?.phone ?? null,
       postalCode: st?.postalCode ?? null,
       address: composedAddress ?? st?.address ?? null,
+      // 住所の細分化欄 (都道府県/市区町村/丁目番地/ビル) を個別に渡し、結合文字列の
+      // 機械的スライスによる誤入力を防ぐ。
+      prefecture: st?.prefecture ?? null,
+      city: st?.city ?? null,
+      addressLine: st?.addressLine ?? null,
+      building: st?.building ?? null,
       url: st?.url ?? null,
       subject: applyVars(job.messageTemplate.subject, company.name),
       message: (() => {

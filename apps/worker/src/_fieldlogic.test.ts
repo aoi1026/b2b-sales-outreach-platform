@@ -25,9 +25,13 @@ const input: FormInput = {
   personLast: "白石",
   personFirst: "秀彦",
   email: "shiraishi@adphoenix.co.jp",
-  phone: "0368091657",
-  postalCode: "1050021",
-  address: "東京都港区東新橋２丁目１１ー７",
+  phone: "03-6809-1657",
+  postalCode: "105-0021",
+  address: "東京都港区東新橋2丁目11-7住友東新橋ビル5号館3階",
+  prefecture: "東京都",
+  city: "港区",
+  addressLine: "東新橋2丁目11-7",
+  building: "住友東新橋ビル5号館3階",
   url: "https://www.adphoenix.co.jp/",
   subject: "ご提案",
   message: "本文",
@@ -169,6 +173,25 @@ console.log("\n=== reg26.smp.ne.jp (name/class/value に手掛かりなし・ラ
 // ラベル「会社名」「お名前」「氏名」を 名(person_first) と誤検出しないこと
 eq("label=会社名 not person_first", detectFieldRole(meta({ name: "x1", labelText: "会社名" })) === "person_first", false);
 eq("label=お名前 not person_first", detectFieldRole(meta({ name: "x2", labelText: "お名前" })) === "person_first", false);
+
+console.log("\n=== 電話/郵便のハイフン除去 (単一欄) ===");
+eq("phone digits-only", roleVal(meta({ name: "tel" })).value, "0368091657");
+eq("postal digits-only", roleVal(meta({ name: "zip" })).value, "1050021");
+
+console.log("\n=== 住所の細分化 (個別値・スライスしない) ===");
+eq("都道府県", roleVal(meta({ name: "pref", labelText: "都道府県" })).value, "東京都");
+eq("市区町村", roleVal(meta({ name: "city", labelText: "市区町村" })).value, "港区");
+{
+  const r = roleVal(meta({ name: "addr_town", labelText: "番地建物" }));
+  eq("番地建物 role", r.role, "address_town");
+  eq("番地建物 value", r.value, "東新橋2丁目11-7 住友東新橋ビル5号館3階");
+}
+eq("建物単独 role", roleVal(meta({ name: "bldg", labelText: "建物名" })).role, "address_building");
+eq("建物単独 value", roleVal(meta({ name: "bldg", labelText: "建物名" })).value, "住友東新橋ビル5号館3階");
+
+console.log("\n=== 会社名フリガナ → company_kana (htm-consul) ===");
+eq("貴社名フリガナ role", detectFieldRole(meta({ name: "kana01", labelText: "貴社名フリガナ" })), "company_kana");
+eq("お名前フリガナ → person", detectFieldRole(meta({ name: "kana02", labelText: "お名前フリガナ" })) === "company_kana", false);
 
 console.log(`\n${fail === 0 ? "🎉 ALL PASS" : "💥 FAILURES"}: ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);
