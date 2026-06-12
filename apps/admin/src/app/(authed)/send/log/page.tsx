@@ -3,11 +3,15 @@ import Breadcrumbs from "@/components/Breadcrumbs";
 import { prisma } from "@/lib/db";
 import {
   bucketOf,
+  bucketWhere,
   BUCKET_BADGE,
   BUCKET_LABEL,
+  BUCKET_ORDER,
+  bucketCountsFrom,
+  summarizeRate,
+  formatRatePct,
   type ResultBucket,
 } from "@/lib/delivery-stats";
-import type { DeliveryResultStatus } from "@mvp/db";
 import { fmtJstDateTime } from "@/lib/date-jst";
 
 export const dynamic = "force-dynamic";
@@ -21,7 +25,7 @@ type SearchParams = Promise<{
 }>;
 
 const PAGE_SIZE = 50;
-const BUCKETS: ResultBucket[] = ["SUCCESS", "FAILED", "REJECTED", "FORM_MISSING"];
+const BUCKETS: ResultBucket[] = BUCKET_ORDER;
 
 export default async function SendLogPage({
   searchParams,
@@ -35,32 +39,20 @@ export default async function SendLogPage({
   const to = sp.to || undefined;
   const page = Math.max(1, Number(sp.page ?? "1") || 1);
 
-  const where: Record<string, unknown> = {};
-  if (caseId) where["job"] = { caseId };
+  // 集計サマリー (合計・成功率) は案件 / 期間の絞り込みは反映するが、分類フィルタは無視して
+  // 全分類を常に表示する。一覧テーブルだけが分類フィルタの影響を受ける。
+  const baseWhere: Record<string, unknown> = {};
+  if (caseId) baseWhere["job"] = { caseId };
   if (from || to) {
-    where["attemptedAt"] = {
+    baseWhere["attemptedAt"] = {
       ...(from ? { gte: new Date(from) } : {}),
       ...(to ? { lte: new Date(to + "T23:59:59") } : {}),
     };
   }
-  if (bucket) {
-    switch (bucket) {
-      case "SUCCESS":
-        where["status"] = "SUCCESS" as DeliveryResultStatus;
-        break;
-      case "REJECTED":
-        where["status"] = "SKIPPED";
-        where["errorType"] = "BLACKLISTED";
-        break;
-      case "FORM_MISSING":
-        where["status"] = "FAILED";
-        where["errorType"] = { in: ["FORM_NOT_FOUND", "FIELD_MISMATCH"] };
-        break;
-      case "FAILED":
-        where["status"] = "FAILED";
-        where["errorType"] = { notIn: ["FORM_NOT_FOUND", "FIELD_MISMATCH"] };
-        break;
-    }
+
+  const where: Record<string, unknown> = { ...baseWhere };
+  if (bucket && (BUCKET_ORDER as string[]).includes(bucket)) {
+    Object.assign(where, bucketWhere(bucket as ResultBucket));
   }
 
   const [total, results, cases, counts] = await Promise.all([
@@ -79,21 +71,13 @@ export default async function SendLogPage({
     prisma.case.findMany({ orderBy: { updatedAt: "desc" } }),
     prisma.deliveryResult.groupBy({
       by: ["status", "errorType"],
+      where: baseWhere,
       _count: true,
     }),
   ]);
 
-  const bucketCounts: Record<ResultBucket, number> = {
-    SUCCESS: 0,
-    FAILED: 0,
-    REJECTED: 0,
-    FORM_MISSING: 0,
-    CANCELLED: 0,
-  };
-  for (const c of counts) {
-    const b = bucketOf(c.status, c.errorType);
-    bucketCounts[b] += c._count;
-  }
+  const summary = summarizeRate(bucketCountsFrom(counts));
+  const bucketCounts = summary.counts;
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const exportHref = `/api/send/log/export?${new URLSearchParams(
@@ -118,19 +102,65 @@ export default async function SendLogPage({
         </a>
       </div>
 
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">
-        {BUCKETS.map((b) => (
-          <Link
-            key={b}
-            href={{ query: { ...(caseId ? { caseId } : {}), bucket: b } }}
-            className={`rounded border p-3 hover:shadow transition ${
-              bucket === b ? "border-[#1e5ab4] ring-1 ring-[#1e5ab4]" : "border-gray-200"
-            }`}
-          >
-            <div className="text-xs text-gray-500">{BUCKET_LABEL[b]}</div>
-            <div className="mt-1 text-xl font-semibold">{bucketCounts[b]}</div>
-          </Link>
-        ))}
+      {/* 送信成功率サマリー */}
+      <div className="rounded border border-gray-200 bg-white p-5 mb-5">
+        <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+          <div className="flex items-end gap-6">
+            <div>
+              <div className="text-xs text-gray-500 mb-1">送信成功率</div>
+              <div className="text-4xl font-bold tracking-tight text-green-700">
+                {formatRatePct(summary.successRate)}
+              </div>
+            </div>
+            <div className="text-sm text-gray-600 pb-1 leading-relaxed">
+              <div>
+                成功 <span className="font-semibold text-green-700">{summary.successCount.toLocaleString()}</span> 件
+                {" / "}
+                有効送信 <span className="font-semibold">{summary.validCount.toLocaleString()}</span> 件
+              </div>
+              <div className="text-xs text-gray-500">
+                送信処理 合計 {summary.total.toLocaleString()} 件
+              </div>
+            </div>
+          </div>
+          <div className="text-[11px] text-gray-500 md:text-right md:max-w-xs leading-relaxed">
+            成功率 ＝ 成功 ÷（成功 ＋ 失敗）×100
+            <br />
+            営業拒否・フォームなし・送信不可・キャンセルは「送信不可／未送信」として分母から除外しています。
+          </div>
+        </div>
+      </div>
+
+      {/* 分類別件数 (クリックで絞り込み) */}
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-5">
+        {BUCKETS.map((b) => {
+          const inDenominator = b === "SUCCESS" || b === "FAILED";
+          return (
+            <Link
+              key={b}
+              href={{
+                query: {
+                  ...(caseId ? { caseId } : {}),
+                  ...(from ? { from } : {}),
+                  ...(to ? { to } : {}),
+                  bucket: b,
+                },
+              }}
+              className={`rounded border p-3 hover:shadow transition ${
+                bucket === b ? "border-[#1e5ab4] ring-1 ring-[#1e5ab4]" : "border-gray-200"
+              }`}
+            >
+              <div className="flex items-center gap-1.5">
+                <span className={`inline-block w-2 h-2 rounded-full ${BUCKET_BADGE[b].split(" ")[0]}`} />
+                <span className="text-xs text-gray-500">{BUCKET_LABEL[b]}</span>
+              </div>
+              <div className="mt-1 text-xl font-semibold">{bucketCounts[b].toLocaleString()}</div>
+              <div className="text-[10px] text-gray-400">
+                {inDenominator ? "分母に算入" : "分母から除外"}
+              </div>
+            </Link>
+          );
+        })}
       </div>
 
       <form className="bg-white rounded border border-gray-200 p-4 mb-5 grid grid-cols-1 md:grid-cols-5 gap-3 text-sm">

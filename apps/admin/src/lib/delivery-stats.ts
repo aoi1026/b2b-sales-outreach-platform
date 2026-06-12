@@ -8,39 +8,158 @@ import {
 } from "./date-jst";
 
 /**
- * 配信結果の 5 分類 (xlsx MS2反映 D-3)
- * 成功 / 失敗 / 営業拒否 / フォームなし / キャンセル
- * (キャンセルは DeliveryJob レベル。ここでは DeliveryResult レベルの 4 分類 + extra)
+ * 配信結果の分類 (SALES STUDIO 成功率仕様)
+ *
+ * 成功率 (%) = 成功 / (成功 + 失敗) × 100
+ *   = 無事に送信完了した件数 / 有効な送信実行件数
+ *
+ * 「有効な送信実行件数 (= 分母)」に含めるのは SUCCESS と FAILED (送信を試みたが失敗) のみ。
+ * 以下は “そもそも送信できなかった / 送らなかった” ため分母から除外する:
+ *   - REJECTED     営業拒否 (送信禁止リスト・営業お断り文言を検知しスキップ)
+ *   - FORM_MISSING フォームなし (問い合わせフォームを特定できず送信不可)
+ *   - UNREACHABLE  送信不可 (URLエラー・タイムアウト等。フォーム到達前に断念=その他エラー)
+ *   - CANCELLED    キャンセル / 未送信 (ユーザ中止・未実行・実行中)
  */
-export type ResultBucket = "SUCCESS" | "FAILED" | "REJECTED" | "FORM_MISSING" | "CANCELLED";
+export type ResultBucket =
+  | "SUCCESS"
+  | "FAILED"
+  | "UNREACHABLE"
+  | "FORM_MISSING"
+  | "REJECTED"
+  | "CANCELLED";
+
+// 画面・CSV での表示順 (成功 → 分母に入る失敗 → 除外系)
+export const BUCKET_ORDER: ResultBucket[] = [
+  "SUCCESS",
+  "FAILED",
+  "UNREACHABLE",
+  "FORM_MISSING",
+  "REJECTED",
+  "CANCELLED",
+];
 
 export const BUCKET_LABEL: Record<ResultBucket, string> = {
   SUCCESS: "成功",
   FAILED: "失敗",
-  REJECTED: "営業拒否",
+  UNREACHABLE: "送信不可",
   FORM_MISSING: "フォームなし",
+  REJECTED: "営業拒否",
   CANCELLED: "キャンセル",
 };
 
 export const BUCKET_BADGE: Record<ResultBucket, string> = {
   SUCCESS: "bg-green-100 text-green-700",
   FAILED: "bg-red-100 text-red-700",
-  REJECTED: "bg-orange-100 text-orange-700",
+  UNREACHABLE: "bg-slate-200 text-slate-600",
   FORM_MISSING: "bg-purple-100 text-purple-700",
+  REJECTED: "bg-orange-100 text-orange-700",
   CANCELLED: "bg-gray-200 text-gray-600",
 };
+
+// 分母 (有効な送信実行件数) に含まれる分類
+export const DENOMINATOR_BUCKETS: ResultBucket[] = ["SUCCESS", "FAILED"];
+
+// 分母から除外する errorType の定義。
+//
+// 「送信不可」= システムが送信処理を完了させることが物理的・規約的に不可能と判断してスキップ
+//   - FORM_NOT_FOUND / FIELD_MISMATCH … フォーム/様式を特定できず入力不可 → 「フォームなし(様式なし)」
+//   - NETWORK_ERROR / CAPTCHA_FAILED   … URLエラー・ページなし・reCAPTCHA認証ブロック → 「送信不可(その他エラー)」
+//
+// 一方「送信エラー」= フォーム入力・送信処理は実行したが失敗 → 分母に【含める】(=「失敗」):
+//   TIMEOUT(サーバータイムアウト) / VALIDATION_ERROR(必須漏れ・文字数オーバー) /
+//   SUBMIT_FAILED(送信ボタン押下後の失敗) / UNKNOWN(分類不能の送信失敗) / null
+const EXCLUDED_FORM_ERRORS: DeliveryErrorType[] = ["FORM_NOT_FOUND", "FIELD_MISMATCH"];
+const EXCLUDED_UNREACHABLE_ERRORS: DeliveryErrorType[] = ["NETWORK_ERROR", "CAPTCHA_FAILED"];
 
 export function bucketOf(
   status: DeliveryResultStatus,
   errorType: DeliveryErrorType | null,
 ): ResultBucket {
   if (status === "SUCCESS") return "SUCCESS";
-  if (status === "SKIPPED" && errorType === "BLACKLISTED") return "REJECTED";
-  if (status === "FAILED" && (errorType === "FORM_NOT_FOUND" || errorType === "FIELD_MISMATCH"))
-    return "FORM_MISSING";
-  if (status === "FAILED") return "FAILED";
-  // PENDING / RUNNING / SKIPPED (non-BL) — treat as pending/other
+  if (status === "SKIPPED") return "REJECTED"; // スキップは営業拒否 (BLACKLISTED) のみ
+  if (status === "PENDING" || status === "RUNNING") return "CANCELLED";
+  // ここから status === "FAILED"
+  if (errorType && EXCLUDED_FORM_ERRORS.includes(errorType)) return "FORM_MISSING";
+  if (errorType && EXCLUDED_UNREACHABLE_ERRORS.includes(errorType)) return "UNREACHABLE";
   return "FAILED";
+}
+
+/**
+ * 分類ごとの Prisma where 断片。一覧 / CSV / 集計で同じ定義を使う唯一の真実。
+ * bucketOf() と必ず一致させること。
+ */
+export function bucketWhere(bucket: ResultBucket): Record<string, unknown> {
+  switch (bucket) {
+    case "SUCCESS":
+      return { status: "SUCCESS" };
+    case "REJECTED":
+      return { status: "SKIPPED" };
+    case "FORM_MISSING":
+      return { status: "FAILED", errorType: { in: EXCLUDED_FORM_ERRORS } };
+    case "UNREACHABLE":
+      return { status: "FAILED", errorType: { in: EXCLUDED_UNREACHABLE_ERRORS } };
+    case "FAILED":
+      // errorType=null の FAILED も bucketOf では「失敗」になるため OR で拾う
+      // (Prisma の notIn は null を除外してしまうため明示的に含める)。
+      return {
+        status: "FAILED",
+        OR: [
+          { errorType: null },
+          { errorType: { notIn: [...EXCLUDED_FORM_ERRORS, ...EXCLUDED_UNREACHABLE_ERRORS] } },
+        ],
+      };
+    case "CANCELLED":
+      return { status: { in: ["PENDING", "RUNNING"] } };
+  }
+}
+
+export type BucketCounts = Record<ResultBucket, number>;
+
+export function emptyBucketCounts(): BucketCounts {
+  return {
+    SUCCESS: 0,
+    FAILED: 0,
+    UNREACHABLE: 0,
+    FORM_MISSING: 0,
+    REJECTED: 0,
+    CANCELLED: 0,
+  };
+}
+
+/**
+ * groupBy(["status","errorType"]) の結果を分類別件数へ畳み込む。
+ */
+export function bucketCountsFrom(
+  rows: { status: DeliveryResultStatus; errorType: DeliveryErrorType | null; _count: number }[],
+): BucketCounts {
+  const counts = emptyBucketCounts();
+  for (const r of rows) counts[bucketOf(r.status, r.errorType)] += r._count;
+  return counts;
+}
+
+export type RateSummary = {
+  counts: BucketCounts;
+  total: number; // 全分類の合計 (= 送信処理を行った全件)
+  validCount: number; // 有効な送信実行件数 (= 分母 = 成功 + 失敗)
+  successCount: number; // 成功
+  successRate: number | null; // 0-1。分母 0 のとき null
+};
+
+export function summarizeRate(counts: BucketCounts): RateSummary {
+  const total = BUCKET_ORDER.reduce((s, b) => s + counts[b], 0);
+  const validCount = DENOMINATOR_BUCKETS.reduce((s, b) => s + counts[b], 0);
+  const successCount = counts.SUCCESS;
+  return {
+    counts,
+    total,
+    validCount,
+    successCount,
+    successRate: validCount > 0 ? successCount / validCount : null,
+  };
+}
+
+export function formatRatePct(rate: number | null): string {
+  return rate == null ? "—" : `${Math.round(rate * 1000) / 10}%`;
 }
 
 export type DashboardKpi = {
@@ -60,12 +179,12 @@ export async function getDashboardKpi(): Promise<DashboardKpi> {
 
   const [todayResults, monthResults, running, newCases] = await Promise.all([
     prisma.deliveryResult.groupBy({
-      by: ["status"],
+      by: ["status", "errorType"],
       where: { attemptedAt: { gte: today } },
       _count: true,
     }),
     prisma.deliveryResult.groupBy({
-      by: ["status"],
+      by: ["status", "errorType"],
       where: { attemptedAt: { gte: month } },
       _count: true,
     }),
@@ -73,27 +192,17 @@ export async function getDashboardKpi(): Promise<DashboardKpi> {
     prisma.case.count({ where: { createdAt: { gte: month } } }),
   ]);
 
-  const tot = (arr: typeof todayResults) =>
-    arr.reduce((s, r) => s + r._count, 0);
-  const ok = (arr: typeof todayResults) =>
-    arr.find((r) => r.status === "SUCCESS")?._count ?? 0;
-  const ng = (arr: typeof todayResults) =>
-    arr.find((r) => r.status === "FAILED")?._count ?? 0;
-
-  const sentToday = tot(todayResults);
-  const sentThisMonth = tot(monthResults);
-
-  const successToday = ok(todayResults);
-  const failedToday = ng(todayResults);
+  const todaySum = summarizeRate(bucketCountsFrom(todayResults));
+  const monthSum = summarizeRate(bucketCountsFrom(monthResults));
 
   return {
-    sentToday,
-    successToday,
-    failedToday,
-    successRateToday: sentToday > 0 ? successToday / sentToday : null,
-    sentThisMonth,
-    successRateThisMonth:
-      sentThisMonth > 0 ? ok(monthResults) / sentThisMonth : null,
+    // 「送信」= 実際に送信処理を行った全件 (分母の有無に関わらず)
+    sentToday: todaySum.total,
+    successToday: todaySum.successCount,
+    failedToday: todaySum.counts.FAILED,
+    successRateToday: todaySum.successRate,
+    sentThisMonth: monthSum.total,
+    successRateThisMonth: monthSum.successRate,
     runningCases: running,
     newCasesThisMonth: newCases,
   };

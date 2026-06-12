@@ -8,6 +8,15 @@ import {
   RESULT_STATUS_BADGE,
   resultStatusLabel,
 } from "@/lib/delivery-status";
+import {
+  bucketOf,
+  emptyBucketCounts,
+  summarizeRate,
+  formatRatePct,
+  BUCKET_ORDER,
+  BUCKET_LABEL,
+  BUCKET_BADGE,
+} from "@/lib/delivery-stats";
 import { pauseJobAction, resumeJobAction, cancelJobAction } from "../actions";
 import DeleteJobButton from "../DeleteJobButton";
 import AutoRefresh from "./AutoRefresh";
@@ -50,6 +59,11 @@ export default async function SendJobDetailPage({
   const processed = job.successCount + job.failedCount + job.skippedCount;
   const progressPct =
     job.plannedCount > 0 ? Math.round((processed / job.plannedCount) * 100) : 0;
+
+  // 送信結果を分類し成功率を算出 (成功率 = 成功 ÷ (成功 + 失敗))
+  const jobBuckets = emptyBucketCounts();
+  for (const r of job.results) jobBuckets[bucketOf(r.status, r.errorType)]++;
+  const jobSummary = summarizeRate(jobBuckets);
   const isActive = job.status === "PENDING" || job.status === "RUNNING";
   const canPause = job.status === "RUNNING" && !job.pauseRequested;
   const canResume = job.status === "PAUSED";
@@ -175,12 +189,33 @@ export default async function SendJobDetailPage({
       </section>
 
       <section className="bg-white border border-gray-200 rounded p-5 mb-5">
-        <h2 className="text-sm font-semibold text-gray-600 mb-3">■ 進捗</h2>
-        <div className="flex gap-4 mb-3 text-sm">
+        <h2 className="text-sm font-semibold text-gray-600 mb-3">■ 進捗・送信成功率</h2>
+
+        <div className="flex flex-col md:flex-row md:items-center gap-6 mb-4">
+          <div>
+            <div className="text-xs text-gray-500 mb-1">送信成功率</div>
+            <div className="text-3xl font-bold tracking-tight text-green-700">
+              {formatRatePct(jobSummary.successRate)}
+            </div>
+            <div className="text-[11px] text-gray-500 mt-1">
+              成功 {jobSummary.successCount} ／ 有効送信 {jobSummary.validCount}（成功＋失敗）
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {BUCKET_ORDER.map((b) => (
+              <span
+                key={b}
+                className={`inline-flex items-center gap-1.5 text-xs px-2.5 py-1 rounded ${BUCKET_BADGE[b]}`}
+              >
+                {BUCKET_LABEL[b]}
+                <span className="font-semibold">{jobBuckets[b]}</span>
+              </span>
+            ))}
+          </div>
+        </div>
+
+        <div className="flex gap-6 mb-3 text-sm">
           <Stat label="計画" value={job.plannedCount} />
-          <Stat label="成功" value={job.successCount} color="text-green-700" />
-          <Stat label="失敗" value={job.failedCount} color="text-red-700" />
-          <Stat label="スキップ" value={job.skippedCount} color="text-gray-600" />
           <Stat label="処理済" value={processed} />
         </div>
         <div className="w-full bg-gray-200 rounded h-3 overflow-hidden">
@@ -189,7 +224,10 @@ export default async function SendJobDetailPage({
             style={{ width: `${progressPct}%` }}
           />
         </div>
-        <div className="mt-1 text-xs text-gray-500 text-right">{progressPct}%</div>
+        <div className="mt-1 text-xs text-gray-500 text-right">進捗 {progressPct}%</div>
+        <p className="mt-2 text-[11px] text-gray-400">
+          成功率 ＝ 成功 ÷（成功 ＋ 失敗）×100。営業拒否・フォームなし・送信不可・キャンセルは分母から除外。
+        </p>
       </section>
 
       <section className="bg-white border border-gray-200 rounded overflow-hidden">

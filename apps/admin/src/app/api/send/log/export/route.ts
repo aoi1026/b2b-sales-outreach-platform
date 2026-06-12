@@ -1,8 +1,13 @@
 import { prisma } from "@/lib/db";
 import { requireUser } from "@/lib/auth";
-import { bucketOf, BUCKET_LABEL } from "@/lib/delivery-stats";
+import {
+  bucketOf,
+  bucketWhere,
+  BUCKET_LABEL,
+  BUCKET_ORDER,
+  type ResultBucket,
+} from "@/lib/delivery-stats";
 import { fmtJstDate, fmtJstDateTime } from "@/lib/date-jst";
-import type { DeliveryResultStatus } from "@mvp/db";
 
 export const dynamic = "force-dynamic";
 
@@ -20,24 +25,8 @@ function buildWhere(sp: URLSearchParams) {
       ...(to ? { lte: new Date(to + "T23:59:59") } : {}),
     };
   }
-  if (bucket) {
-    switch (bucket) {
-      case "SUCCESS":
-        where["status"] = "SUCCESS" as DeliveryResultStatus;
-        break;
-      case "REJECTED":
-        where["status"] = "SKIPPED";
-        where["errorType"] = "BLACKLISTED";
-        break;
-      case "FORM_MISSING":
-        where["status"] = "FAILED";
-        where["errorType"] = { in: ["FORM_NOT_FOUND", "FIELD_MISMATCH"] };
-        break;
-      case "FAILED":
-        where["status"] = "FAILED";
-        where["errorType"] = { notIn: ["FORM_NOT_FOUND", "FIELD_MISMATCH"] };
-        break;
-    }
+  if (bucket && (BUCKET_ORDER as string[]).includes(bucket)) {
+    Object.assign(where, bucketWhere(bucket as ResultBucket));
   }
   return where;
 }
