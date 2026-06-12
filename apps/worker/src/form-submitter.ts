@@ -1,4 +1,4 @@
-import { chromium, type Browser, type Page, type ElementHandle } from "playwright";
+import { chromium, type Browser, type BrowserContext, type Page, type ElementHandle } from "playwright";
 import type { FormInput, SubmitResult } from "./types.ts";
 import { startCaptchaSolve, injectCaptchaToken, type CaptchaSolveHandle } from "./captcha-solver.ts";
 import {
@@ -138,6 +138,24 @@ function buildProxyConfig(
     ...(username ? { username } : {}),
     ...(password ? { password } : {}),
   };
+}
+
+// 送信用ブラウザ context を生成 (プロキシ + UA を共通化)。forceV3Token 指定時は
+// grecaptcha を乗っ取るスクリプトを注入する。runSubmit / runSubmitAI / solveCF7v3Token 共通。
+async function createSubmitContext(
+  useProxy: boolean,
+  forceV3Token?: string,
+): Promise<BrowserContext> {
+  const browser = await getBrowser();
+  const proxy = buildProxyConfig(useProxy);
+  const context = await browser.newContext({
+    userAgent: USER_AGENT,
+    ...(proxy ? { proxy } : {}),
+  });
+  if (forceV3Token) {
+    await context.addInitScript(grecaptchaHijackScript(forceV3Token));
+  }
+  return context;
 }
 
 // ============= Form picker =============
@@ -424,7 +442,9 @@ async function getElementMeta(_page: Page, el: ElementHandle<Element>) {
               'label, dt, [class*="label"], [class*="title"], [class*="ttl"], [class*="head"]',
             );
             if (lb) cands.push(lb);
-            for (const sp of Array.from(anc.querySelectorAll("span, p"))) cands.push(sp);
+            // td も候補に含める: <tr><td>会社名</td><td>[input]</td></tr> 形式の
+            // テーブルレイアウト (ラベルが <th> ではなく隣の <td> に入る wpcf7 等) に対応。
+            for (const sp of Array.from(anc.querySelectorAll("td, span, p"))) cands.push(sp);
             for (const lab of cands) {
               if (lab.querySelector("input, select, textarea")) continue;
               const raw = (lab.textContent || "").replace(/[\s　]+/g, " ").trim();
@@ -434,6 +454,19 @@ async function getElementMeta(_page: Page, el: ElementHandle<Element>) {
                 labelText = stripped;
                 break;
               }
+            }
+            if (!labelText) {
+              // 祖先要素「自身の直接テキストノード」もラベル候補にする (子要素のテキストは除く)。
+              // Contact Form 7 の <p>会社名 <span>必須</span><br>[text* text-01]</p> のように
+              // ラベルが <label>/<th> ではなく裸のテキストノードで置かれる形式に対応。
+              const direct = Array.from(anc.childNodes)
+                .filter((n) => n.nodeType === 3)
+                .map((n) => n.textContent || "")
+                .join(" ")
+                .replace(/[\s　]+/g, " ")
+                .replace(/[*＊※]|必須|任意|required|optional/gi, "")
+                .trim();
+              if (direct.length >= 1 && direct.length <= 40) labelText = direct;
             }
           }
           anc = anc.parentElement;
@@ -496,8 +529,12 @@ export function detectFieldRole(meta: ElementMeta): FieldRole {
   const { tagName, type, idLower, nameLower, combined, autocomplete } = meta;
   const idOrName = `${idLower}|${nameLower}`;
 
-  // <textarea> 要素は常に本文
-  if (tagName === "textarea") return "message";
+  // <textarea> 要素は基本的に本文。ただし reCAPTCHA/hCaptcha/Turnstile の応答トークン用
+  // 隠し textarea (g-recaptcha-response 等) は本文ではないので除外する。
+  if (tagName === "textarea") {
+    if (/recaptcha|captcha|hcaptcha|turnstile|cf-turnstile/.test(idOrName)) return null;
+    return "message";
+  }
 
   // ====== autocomplete (Web標準トークン) による判定 — name/id より信頼度が高い ======
   // n-kokudo のように autocomplete="name/tel/email/postal-code/address-level1/2" で
@@ -1928,15 +1965,7 @@ async function runSubmit(
   options: SubmitOptions | undefined,
   useProxy: boolean,
 ): Promise<SubmitResult> {
-  const browser = await getBrowser();
-  const proxy = buildProxyConfig(useProxy);
-  const context = await browser.newContext({
-    userAgent: USER_AGENT,
-    ...(proxy ? { proxy } : {}),
-  });
-  if (options?.forceV3Token) {
-    await context.addInitScript(grecaptchaHijackScript(options.forceV3Token));
-  }
+  const context = await createSubmitContext(useProxy, options?.forceV3Token);
   const page = await context.newPage();
   const overallMs = options?.timeoutMs ?? 170_000;
   const stageRef = { s: "ナビゲーション" };
@@ -1959,7 +1988,7 @@ async function runSubmit(
 
     stageRef.s = "フォーム検出";
     // 描画待ち + 埋め込み iframe フォームへの追従を含めて検出する
-    const form = await locateForm(page);
+    let form = await locateForm(page);
     if (!form) {
       return await attachShot(page, options, {
         status: "failed",
@@ -1979,10 +2008,26 @@ async function runSubmit(
     }
 
     // 1) tel × 3 / zip × 2 のような分割入力欄を先に埋める (ユーザ要件)
-    const consumedNames = await fillSplitGroups(form, input);
+    let consumedNames = await fillSplitGroups(form, input);
 
     // 2) 通常のテキスト/textarea/email/tel フィールドを埋める
-    const filled = await fillTextLikeFields(page, form, input, consumedNames);
+    let filled = await fillTextLikeFields(page, form, input, consumedNames);
+
+    // 充填ゼロ = 項目名そのものの不一致とは限らず、描画途中や入力中の
+    // コンテキスト破棄 (ページ遷移/再描画) で getElementMeta が空メタを返した、という
+    // 一過性のタイミング失敗のことが多い。即 FIELD_MISMATCH とせず、ページを落ち着かせて
+    // フォームを取り直し、もう一度だけ充填を試みる。
+    if (filled === 0 && consumedNames.size === 0) {
+      await page.waitForLoadState("networkidle", { timeout: 5_000 }).catch(() => {});
+      await page.waitForTimeout(1_500).catch(() => {});
+      const reForm = await locateForm(page);
+      if (reForm) {
+        form = reForm;
+        consumedNames = await fillSplitGroups(form, input);
+        filled = await fillTextLikeFields(page, form, input, consumedNames);
+      }
+    }
+
     if (filled === 0 && consumedNames.size === 0) {
       return await attachShot(page, options, {
         status: "failed",
@@ -2104,12 +2149,7 @@ async function runSubmit(
 // Method A 用: ページを開いて「CF7 + reCAPTCHA v3」の社か確認し、該当時のみ CapSolver で
 // 高スコアトークンを取得して返す。CF7-v3 以外は null (= Method A を発動させない)。
 async function solveCF7v3Token(formUrl: string, useProxy: boolean): Promise<string | null> {
-  const browser = await getBrowser();
-  const proxy = buildProxyConfig(useProxy);
-  const context = await browser.newContext({
-    userAgent: USER_AGENT,
-    ...(proxy ? { proxy } : {}),
-  });
+  const context = await createSubmitContext(useProxy);
   const page = await context.newPage();
   try {
     await gotoWithRetry(page, formUrl);
@@ -2352,16 +2392,8 @@ async function runSubmitAI(
   useProxy: boolean,
   cachedPlan?: FillPlan,
 ): Promise<SubmitResult> {
-  const browser = await getBrowser();
-  const proxy = buildProxyConfig(useProxy);
-  const context = await browser.newContext({
-    userAgent: USER_AGENT,
-    ...(proxy ? { proxy } : {}),
-  });
-  // Method A: forceV3Token 指定時は grecaptcha を乗っ取り我々のトークンを使わせる。
-  if (options?.forceV3Token) {
-    await context.addInitScript(grecaptchaHijackScript(options.forceV3Token));
-  }
+  // Method A: forceV3Token 指定時は createSubmitContext 内で grecaptcha を乗っ取る。
+  const context = await createSubmitContext(useProxy, options?.forceV3Token);
   const page = await context.newPage();
   const overallMs = options?.timeoutMs ?? 170_000;
   const stageRef = { s: "AI: ナビゲーション" };

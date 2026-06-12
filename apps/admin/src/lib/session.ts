@@ -26,7 +26,12 @@ export async function createSession(payload: SessionPayload) {
   const jar = await cookies();
   jar.set(SESSION_COOKIE, token, {
     httpOnly: true,
-    secure: process.env["NODE_ENV"] === "production",
+    // Default: secure in production (HTTPS). Set COOKIE_SECURE=false to allow
+    // login over plain HTTP (e.g. reaching the VPS by IP before TLS is set up).
+    secure:
+      process.env["COOKIE_SECURE"] !== undefined
+        ? process.env["COOKIE_SECURE"] === "true"
+        : process.env["NODE_ENV"] === "production",
     sameSite: "lax",
     maxAge: SESSION_MAX_AGE,
     path: "/",
