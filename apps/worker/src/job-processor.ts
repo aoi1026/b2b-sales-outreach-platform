@@ -102,6 +102,7 @@ function toFullWidthInput(inp: FormInput): FormInput {
     personFirst: fw(inp.personFirst) ?? null,
     address: fw(inp.address) ?? null,
     position: fw(inp.position) ?? null,
+    department: fw(inp.department) ?? null,
   };
 }
 
@@ -109,6 +110,18 @@ function applyVars(text: string, companyName: string): string {
   return text
     .replace(/\{\{\s*会社名\s*\}\}/g, companyName)
     .replace(/\{\{\s*担当者名\s*\}\}/g, "ご担当者");
+}
+
+// 送信文章内の http(s) URL を計測用リダイレクト URL に置換する。
+// 形式: {TRACK_BASE_URL}/r/{resultId}?u={エンコード済み元URL}
+function rewriteTrackedUrls(text: string, resultId: string): string {
+  const base = (process.env["TRACK_BASE_URL"] ?? "").replace(/\/$/, "");
+  if (!base) return text; // 未設定なら無効化 (素の文章のまま)
+  return text.replace(/https?:\/\/[^\s<>"'）)、，,]+/g, (orig) => {
+    // 既に計測 URL の場合は二重置換しない
+    if (orig.startsWith(base)) return orig;
+    return `${base}/r/${resultId}?u=${encodeURIComponent(orig)}`;
+  });
 }
 
 async function ensureJobResultRows(jobId: string): Promise<void> {
@@ -242,29 +255,51 @@ export async function processDeliveryJob(
       continue;
     }
 
-    const personName = job.senderTemplate?.personName ?? null;
-    const { last: personLast, first: personFirst } = splitNameParts(personName);
+    const st = job.senderTemplate;
+    const personName = st?.personName ?? null;
+    // 姓/名は個別欄を優先し、無ければ氏名を半分割。
+    const split = splitNameParts(personName);
+    const personLast = st?.familyName ?? split.last;
+    const personFirst = st?.givenName ?? split.first;
+    // カナ氏名: 個別カナがあれば結合、無ければ従来の personKatakana。
+    const personKatakana =
+      [st?.familyNameKana, st?.givenNameKana].filter(Boolean).join(" ") ||
+      st?.personKatakana ||
+      null;
+    // 住所: 都道府県/市区町村/丁目番地/ビルを結合。無ければ従来の address。
+    const composedAddress =
+      [st?.prefecture, st?.city, st?.addressLine, st?.building]
+        .map((p) => p?.trim())
+        .filter(Boolean)
+        .join("") || null;
 
     const input: FormInput = {
-      company: job.senderTemplate?.companyName ?? null,
+      company: st?.companyName ?? null,
       // 会社のカナは現状 SenderTemplate に欄がないため null。form-submitter 側では
       // 不在時は漢字社名にフォールバックする。
       companyKana: null,
       person: personName,
-      personHiragana: job.senderTemplate?.personHiragana ?? null,
-      personKatakana: job.senderTemplate?.personKatakana ?? null,
+      personHiragana: st?.personHiragana ?? null,
+      personKatakana,
       // personKana は後方互換用。明示的にカタカナがあればそれ、無ければ漢字。
-      personKana: job.senderTemplate?.personKatakana ?? null,
+      personKana: personKatakana,
       personLast,
       personFirst,
-      email: job.senderTemplate?.email ?? null,
-      phone: job.senderTemplate?.phone ?? null,
-      postalCode: job.senderTemplate?.postalCode ?? null,
-      address: job.senderTemplate?.address ?? null,
-      url: job.senderTemplate?.url ?? null,
+      email: st?.email ?? null,
+      phone: st?.phone ?? null,
+      postalCode: st?.postalCode ?? null,
+      address: composedAddress ?? st?.address ?? null,
+      url: st?.url ?? null,
       subject: applyVars(job.messageTemplate.subject, company.name),
-      message: applyVars(job.messageTemplate.body, company.name),
-      position: "担当者",
+      message: (() => {
+        const body = applyVars(job.messageTemplate.body, company.name);
+        // URL クリック計測が有効なら本文の URL を計測リンクへ置換。
+        const resultId = job.results.find((r) => r.companyId === company.id)?.id;
+        return job.trackUrlClicks && resultId ? rewriteTrackedUrls(body, resultId) : body;
+      })(),
+      // 役職・部署はテンプレートの値を使用 (未設定時は従来どおり「担当者」にフォールバック)。
+      position: st?.position ?? "担当者",
+      department: st?.department ?? null,
     };
 
     await prisma.deliveryResult.update({
@@ -358,10 +393,13 @@ export async function processDeliveryJob(
       // 1) 短文フォールバック
       const fb = job.fallbackMessageTemplate;
       if (fb && !outOfTime() && FALLBACK_RETRYABLE.has(main.result.errorType ?? "")) {
+        const fbResultId = job.results.find((r) => r.companyId === company.id)?.id;
+        const fbBody = applyVars(fb.body, company.name);
         const fbInput: FormInput = {
           ...input,
           subject: applyVars(fb.subject, company.name),
-          message: applyVars(fb.body, company.name),
+          message:
+            job.trackUrlClicks && fbResultId ? rewriteTrackedUrls(fbBody, fbResultId) : fbBody,
         };
         const fallback = await attemptLoop(fbInput, MAX_ATTEMPTS, "fallback");
         attempts += fallback.attempts;

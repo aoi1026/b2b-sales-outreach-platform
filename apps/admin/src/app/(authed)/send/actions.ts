@@ -16,6 +16,7 @@ const createSchema = z.object({
   fallbackMessageTemplateId: z.string().optional().or(z.literal("")),
   senderTemplateId: z.string().optional().or(z.literal("")),
   note: z.string().max(300).optional(),
+  trackUrlClicks: z.string().optional(),
 });
 
 export async function createDeliveryJobAction(formData: FormData): Promise<void> {
@@ -28,6 +29,7 @@ export async function createDeliveryJobAction(formData: FormData): Promise<void>
     fallbackMessageTemplateId: formData.get("fallbackMessageTemplateId")?.toString() ?? "",
     senderTemplateId: formData.get("senderTemplateId")?.toString() ?? "",
     note: formData.get("note")?.toString() || undefined,
+    trackUrlClicks: formData.get("trackUrlClicks")?.toString() || undefined,
   });
   if (!parsed.success) return;
   const d = parsed.data;
@@ -57,6 +59,7 @@ export async function createDeliveryJobAction(formData: FormData): Promise<void>
       status: "PENDING",
       plannedCount: list._count.companies,
       note: d.note || null,
+      trackUrlClicks: d.trackUrlClicks === "on" || d.trackUrlClicks === "true",
     },
   });
 
@@ -141,4 +144,48 @@ export async function deleteJobAction(
   // DeliveryResult は onDelete: Cascade なので job 削除で連鎖削除される
   await prisma.deliveryJob.delete({ where: { id: jobId } });
   revalidatePath("/send");
+}
+
+// ジョブ単位の備考を更新
+export async function updateJobNoteAction(
+  jobId: string,
+  formData: FormData,
+): Promise<void> {
+  const user = await requireUser();
+  if (!user) return;
+  const note = formData.get("note")?.toString().slice(0, 300) || null;
+  await prisma.deliveryJob.update({ where: { id: jobId }, data: { note } });
+  revalidatePath(`/send/${jobId}`);
+}
+
+// 結果行の「手動送信済」フラグをトグル
+export async function toggleResultManualSentAction(
+  resultId: string,
+  jobId: string,
+): Promise<void> {
+  const user = await requireUser();
+  if (!user) return;
+  const r = await prisma.deliveryResult.findUnique({
+    where: { id: resultId },
+    select: { manualSent: true },
+  });
+  if (!r) return;
+  await prisma.deliveryResult.update({
+    where: { id: resultId },
+    data: { manualSent: !r.manualSent },
+  });
+  revalidatePath(`/send/${jobId}`);
+}
+
+// 結果行の備考を更新
+export async function updateResultNoteAction(
+  resultId: string,
+  jobId: string,
+  formData: FormData,
+): Promise<void> {
+  const user = await requireUser();
+  if (!user) return;
+  const note = formData.get("note")?.toString().slice(0, 500) || null;
+  await prisma.deliveryResult.update({ where: { id: resultId }, data: { note } });
+  revalidatePath(`/send/${jobId}`);
 }

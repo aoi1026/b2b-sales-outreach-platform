@@ -228,17 +228,29 @@ export default function NewJobClient({
         </section>
       )}
 
-      <section className="bg-white border border-gray-200 rounded p-5">
-        <h2 className="text-sm font-semibold text-gray-600 mb-3">■ メモ (任意)</h2>
-        <input
-          type="text"
-          name="note"
-          value={note}
-          onChange={(e) => setNote(e.target.value)}
-          maxLength={300}
-          placeholder="例: 2026年4月第1週配信"
-          className="w-full border border-gray-300 rounded px-3 py-1.5 text-sm"
-        />
+      <section className="bg-white border border-gray-200 rounded p-5 space-y-4">
+        <div>
+          <h2 className="text-sm font-semibold text-gray-600 mb-3">■ メモ (任意)</h2>
+          <input
+            type="text"
+            name="note"
+            value={note}
+            onChange={(e) => setNote(e.target.value)}
+            maxLength={300}
+            placeholder="例: 2026年4月第1週配信"
+            className="w-full border border-gray-300 rounded px-3 py-1.5 text-sm"
+          />
+        </div>
+        <div>
+          <h2 className="text-sm font-semibold text-gray-600 mb-2">■ URLアクセスの記録 (任意)</h2>
+          <label className="inline-flex items-center gap-2 text-sm">
+            <input type="checkbox" name="trackUrlClicks" value="on" className="rounded border-gray-300" />
+            送信文章中の URL がクリックされたかを記録する
+          </label>
+          <p className="text-[11px] text-gray-500 mt-1">
+            ※ ON にすると本文中の URL が記録用 URL に置き換えられ、ジョブ詳細でクリック率を確認できます。
+          </p>
+        </div>
       </section>
 
       {error && (

@@ -150,13 +150,25 @@ model SenderTemplate {
   id             String   @id @default(cuid())
   name           String
   companyName    String   @map("company_name")
+  // 担当者氏名: 後方互換のため personName (結合) を残しつつ、姓/名・カナを個別保持する。
   personName     String   @map("person_name")
+  familyName     String?  @map("family_name") // 姓
+  givenName      String?  @map("given_name") // 名
   personHiragana String?  @map("person_hiragana")
   personKatakana String?  @map("person_katakana")
+  familyNameKana String?  @map("family_name_kana") // 姓 (カナ)
+  givenNameKana  String?  @map("given_name_kana") // 名 (カナ)
+  department     String?  @map("department") // 部署
+  position       String?  @map("position") // 役職
   email          String
   phone          String?
   postalCode     String?  @map("postal_code")
+  // address (結合住所) は後方互換のため残す。新規は都道府県/市区町村/丁目番地/ビルを個別保持。
   address        String?
+  prefecture     String?  @map("prefecture") // 都道府県
+  city           String?  @map("city") // 市区町村
+  addressLine    String?  @map("address_line") // 丁目番地
+  building       String?  @map("building") // ビル名・部屋番号
   url            String?
   createdAt      DateTime @default(now()) @map("created_at")
   updatedAt      DateTime @updatedAt @map("updated_at")
@@ -232,6 +244,8 @@ model DeliveryJob {
   skippedCount      Int               @default(0) @map("skipped_count")
   pauseRequested    Boolean           @default(false) @map("pause_requested")
   cancelRequested   Boolean           @default(false) @map("cancel_requested")
+  // 送信文章内の URL をトラッキング用 URL へ置換しクリックを記録するか
+  trackUrlClicks    Boolean           @default(false) @map("track_url_clicks")
   note              String?
   createdAt         DateTime          @default(now()) @map("created_at")
   updatedAt         DateTime          @updatedAt @map("updated_at")
@@ -261,6 +275,12 @@ model DeliveryResult {
   attempts     Int                  @default(0)
   // 送信時の全画面スクリーンショット (PNG)。WORKER_SCREENSHOT=true のときのみ保存。
   screenshot   Bytes?
+  // 手動送信済フラグ・行単位の備考 (オペレータが管理画面から編集)
+  manualSent   Boolean              @default(false) @map("manual_sent")
+  note         String?              @db.Text
+  // URL クリック計測 (trackUrlClicks 有効ジョブのみ)
+  urlClicks     Int                 @default(0) @map("url_clicks")
+  lastClickedAt DateTime?           @map("last_clicked_at")
   attemptedAt  DateTime?            @map("attempted_at")
   createdAt    DateTime             @default(now()) @map("created_at")
   updatedAt    DateTime             @updatedAt @map("updated_at")

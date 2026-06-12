@@ -1,13 +1,9 @@
+import type { ReactNode } from "react";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import Breadcrumbs from "@/components/Breadcrumbs";
 import { prisma } from "@/lib/db";
-import {
-  JOB_STATUS_BADGE,
-  JOB_STATUS_LABEL,
-  RESULT_STATUS_BADGE,
-  resultStatusLabel,
-} from "@/lib/delivery-status";
+import { JOB_STATUS_BADGE, JOB_STATUS_LABEL } from "@/lib/delivery-status";
 import {
   bucketOf,
   emptyBucketCounts,
@@ -16,8 +12,16 @@ import {
   BUCKET_ORDER,
   BUCKET_LABEL,
   BUCKET_BADGE,
+  type ResultBucket,
 } from "@/lib/delivery-stats";
-import { pauseJobAction, resumeJobAction, cancelJobAction } from "../actions";
+import {
+  pauseJobAction,
+  resumeJobAction,
+  cancelJobAction,
+  updateJobNoteAction,
+  toggleResultManualSentAction,
+  updateResultNoteAction,
+} from "../actions";
 import DeleteJobButton from "../DeleteJobButton";
 import AutoRefresh from "./AutoRefresh";
 import { fmtJstDateTime, fmtJstTime } from "@/lib/date-jst";
@@ -26,10 +30,19 @@ export const dynamic = "force-dynamic";
 
 export default async function SendJobDetailPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ id: string }>;
+  searchParams: Promise<{ q?: string; rb?: string | string[] }>;
 }) {
   const { id } = await params;
+  const sp = await searchParams;
+  const q = (sp.q ?? "").trim();
+  const rbSet = new Set(
+    (Array.isArray(sp.rb) ? sp.rb : sp.rb ? [sp.rb] : []).filter((b) =>
+      (BUCKET_ORDER as string[]).includes(b),
+    ) as ResultBucket[],
+  );
   const job = await prisma.deliveryJob.findUnique({
     where: { id },
     include: {
@@ -64,6 +77,40 @@ export default async function SendJobDetailPage({
   const jobBuckets = emptyBucketCounts();
   for (const r of job.results) jobBuckets[bucketOf(r.status, r.errorType)]++;
   const jobSummary = summarizeRate(jobBuckets);
+
+  // 送信元 (送信内容) の表示用整形
+  const st = job.senderTemplate;
+  const senderFullName = st
+    ? [st.familyName, st.givenName].filter(Boolean).join(" ")
+    : "";
+  const senderAddress = st
+    ? [st.prefecture, st.city, st.addressLine, st.building]
+        .map((p) => p?.trim())
+        .filter(Boolean)
+        .join("") || st.address
+    : null;
+
+  // 会社別の結果フィルタ (会社名 or フォームURL 部分一致 + 分類チェックボックス)
+  const qLower = q.toLowerCase();
+  const filteredResults = job.results.filter((r) => {
+    if (rbSet.size > 0 && !rbSet.has(bucketOf(r.status, r.errorType))) return false;
+    if (q && !(`${r.company.name} ${r.company.formUrl}`.toLowerCase().includes(qLower)))
+      return false;
+    return true;
+  });
+
+  // CSV ダウンロード URL (現在のフィルタを引き継ぐ)
+  const exportParams = new URLSearchParams();
+  exportParams.set("jobId", id);
+  if (q) exportParams.set("q", q);
+  for (const b of rbSet) exportParams.append("rb", b);
+  const exportHref = `/api/send/log/export?${exportParams.toString()}`;
+
+  // URL クリック計測 (trackUrlClicks 有効時): クリックした企業の割合 = クリック>0 / 成功
+  const clickedCompanies = job.results.filter((r) => r.urlClicks > 0).length;
+  const clickRate =
+    jobSummary.successCount > 0 ? clickedCompanies / jobSummary.successCount : null;
+
   const isActive = job.status === "PENDING" || job.status === "RUNNING";
   const canPause = job.status === "RUNNING" && !job.pauseRequested;
   const canResume = job.status === "PAUSED";
@@ -188,6 +235,31 @@ export default async function SendJobDetailPage({
         </dl>
       </section>
 
+      {job.senderTemplate && (
+        <section className="bg-white border border-gray-200 rounded overflow-hidden mb-5">
+          <div className="px-5 py-2.5 bg-gray-800 text-white text-sm font-semibold">送信内容</div>
+          <dl className="text-sm">
+            <SenderRow label="担当者" highlight>
+              <Link
+                href={`/templates/sender/${job.senderTemplate.id}`}
+                className="text-[#1e5ab4] hover:underline"
+              >
+                {job.senderTemplate.personName || senderFullName} ✎
+              </Link>
+            </SenderRow>
+            <SenderRow label="会社名">{job.senderTemplate.companyName}</SenderRow>
+            <SenderRow label="郵便番号" highlight>{job.senderTemplate.postalCode ?? "—"}</SenderRow>
+            <SenderRow label="住所">{senderAddress ?? "—"}</SenderRow>
+            <SenderRow label="部署" highlight>{job.senderTemplate.department ?? "—"}</SenderRow>
+            <SenderRow label="役職">{job.senderTemplate.position ?? "—"}</SenderRow>
+            <SenderRow label="姓 (カナ)" highlight>{job.senderTemplate.familyNameKana ?? "—"}</SenderRow>
+            <SenderRow label="名 (カナ)">{job.senderTemplate.givenNameKana ?? "—"}</SenderRow>
+            <SenderRow label="メールアドレス" highlight>{job.senderTemplate.email}</SenderRow>
+            <SenderRow label="電話番号">{job.senderTemplate.phone ?? "—"}</SenderRow>
+          </dl>
+        </section>
+      )}
+
       <section className="bg-white border border-gray-200 rounded p-5 mb-5">
         <h2 className="text-sm font-semibold text-gray-600 mb-3">■ 進捗・送信成功率</h2>
 
@@ -230,81 +302,238 @@ export default async function SendJobDetailPage({
         </p>
       </section>
 
-      <section className="bg-white border border-gray-200 rounded overflow-hidden">
-        <div className="px-4 py-2 bg-gray-50 border-b border-gray-200 text-sm font-semibold text-gray-600 flex items-center justify-between">
-          <span>■ 送信結果 ({job.results.length} 件)</span>
-          <a
-            href="http://localhost:3001/dummy-log"
-            target="_blank"
-            rel="noreferrer"
-            className="text-xs text-[#1e5ab4] hover:underline font-normal"
-          >
-            ダミーフォーム受信ログを開く (dev) ↗
-          </a>
-        </div>
-        <table className="w-full text-sm">
-          <thead className="bg-gray-50 border-b border-gray-200 text-gray-600">
-            <tr>
-              <th className="text-left px-3 py-2 font-medium">会社名</th>
-              <th className="text-left px-3 py-2 font-medium">フォームURL</th>
-              <th className="text-left px-3 py-2 font-medium w-20">状態</th>
-              <th className="text-left px-3 py-2 font-medium">エラー</th>
-              <th className="text-left px-3 py-2 font-medium w-16">試行</th>
-              <th className="text-left px-3 py-2 font-medium w-32">実行時刻</th>
-              <th className="text-left px-3 py-2 font-medium w-28">スクリーンショット</th>
-            </tr>
-          </thead>
-          <tbody>
-            {job.results.map((r) => (
-              <tr key={r.id} className="border-b border-gray-100 hover:bg-gray-50">
-                <td className="px-3 py-2">{r.company.name}</td>
-                <td className="px-3 py-2 text-xs text-gray-600 truncate max-w-[240px]">
-                  <a href={r.company.formUrl} target="_blank" rel="noreferrer" className="hover:underline">
-                    {r.company.formUrl}
-                  </a>
-                </td>
-                <td className="px-3 py-2">
-                  <span className={`inline-block text-xs px-2 py-0.5 rounded ${RESULT_STATUS_BADGE[r.status]}`}>
-                    {resultStatusLabel(r.status, r.errorType)}
-                  </span>
-                </td>
-                <td className="px-3 py-2 text-xs text-gray-600 truncate max-w-[200px]">
-                  {r.errorType ? (
-                    <span title={r.errorMessage ?? ""}>
-                      {r.errorType} {r.errorMessage ? `— ${r.errorMessage.slice(0, 50)}` : ""}
-                    </span>
-                  ) : (
-                    "—"
-                  )}
-                </td>
-                <td className="px-3 py-2 text-xs text-gray-600">{r.attempts}</td>
-                <td className="px-3 py-2 text-xs text-gray-600 whitespace-nowrap">
-                  {fmtJstTime(r.attemptedAt)}
-                </td>
-                <td className="px-3 py-2">
-                  {shotIds.has(r.id) ? (
-                    <a
-                      href={`/api/send/screenshot/${r.id}`}
-                      target="_blank"
-                      rel="noreferrer"
-                      title="クリックで拡大表示"
-                    >
-                      {/* eslint-disable-next-line @next/next/no-img-element */}
-                      <img
-                        src={`/api/send/screenshot/${r.id}`}
-                        alt={`${r.company.name} のスクリーンショット`}
-                        className="h-12 w-20 object-cover object-top border border-gray-200 rounded hover:ring-2 hover:ring-[#1e5ab4]"
-                      />
-                    </a>
-                  ) : (
-                    <span className="text-xs text-gray-400">—</span>
-                  )}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+      {job.trackUrlClicks && (
+        <section className="bg-white border border-gray-200 rounded overflow-hidden mb-5">
+          <div className="px-5 py-2.5 bg-gray-800 text-white text-sm font-semibold">
+            URLアクセス記録
+          </div>
+          <div className="p-5">
+            <div className="text-xs text-gray-500 mb-1">クリックした企業の割合</div>
+            <div className="flex items-end gap-2 mb-2">
+              <div className="text-3xl font-bold text-green-700">
+                {clickRate == null ? "—" : `${Math.round(clickRate * 100)}%`}
+              </div>
+              <div className="text-xs text-gray-500 pb-1">
+                {clickedCompanies}/{jobSummary.successCount}
+              </div>
+            </div>
+            <div className="w-full bg-gray-200 rounded h-3 overflow-hidden">
+              <div
+                className="bg-green-500 h-3"
+                style={{ width: `${clickRate == null ? 0 : Math.round(clickRate * 100)}%` }}
+              />
+            </div>
+          </div>
+        </section>
+      )}
+
+      {/* 備考 (ジョブ単位・編集可) */}
+      <section className="bg-white border border-gray-200 rounded p-5 mb-5">
+        <h2 className="text-sm font-semibold text-gray-600 mb-2">■ 備考</h2>
+        <form action={updateJobNoteAction.bind(null, id)} className="flex items-start gap-3">
+          <textarea
+            name="note"
+            defaultValue={job.note ?? ""}
+            maxLength={300}
+            rows={2}
+            className="flex-1 border border-gray-300 rounded px-3 py-1.5 text-sm"
+            placeholder="このジョブのメモ"
+          />
+          <button className="px-4 py-2 rounded bg-[#1e5ab4] text-white hover:bg-[#17498f] text-sm whitespace-nowrap">
+            保存
+          </button>
+        </form>
       </section>
+
+      <section className="bg-white border border-gray-200 rounded overflow-hidden">
+        <div className="px-4 py-3 bg-gray-50 border-b border-gray-200">
+          {/* 会社名・URL / 結果フィルタ */}
+          <form method="get" className="space-y-3">
+            <div>
+              <label className="block text-xs font-semibold text-gray-600 mb-1">会社名・URL</label>
+              <input
+                name="q"
+                defaultValue={q}
+                placeholder="会社名 or URL（部分一致）"
+                className="w-full md:w-1/2 border border-gray-300 rounded px-3 py-1.5 text-sm"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-gray-600 mb-1">結果</label>
+              <div className="flex flex-wrap gap-x-4 gap-y-1.5">
+                {BUCKET_ORDER.map((b) => (
+                  <label key={b} className="inline-flex items-center gap-1.5 text-sm">
+                    <input
+                      type="checkbox"
+                      name="rb"
+                      value={b}
+                      defaultChecked={rbSet.has(b)}
+                      className="rounded border-gray-300"
+                    />
+                    {BUCKET_LABEL[b]}
+                  </label>
+                ))}
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <button className="px-4 py-1.5 rounded bg-[#1e5ab4] text-white hover:bg-[#17498f] text-sm">
+                検索
+              </button>
+              <Link href={`/send/${id}`} className="px-4 py-1.5 rounded border border-gray-300 hover:bg-gray-50 text-sm">
+                クリア
+              </Link>
+              <a
+                href={exportHref}
+                className="ml-auto px-3 py-1.5 rounded border border-gray-300 hover:bg-gray-50 text-sm"
+              >
+                ⬇ ダウンロード
+              </a>
+            </div>
+          </form>
+        </div>
+
+        <div className="px-4 py-2 text-xs text-gray-500 border-b border-gray-100">
+          ■ 送信結果 {filteredResults.length} 件
+          {(q || rbSet.size > 0) && <>（全 {job.results.length} 件中）</>}
+          <span className="ml-2 text-gray-400">
+            ※ 結果が「未実行」「キャンセル」の行は CSV に含まれません
+          </span>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm whitespace-nowrap">
+            <thead className="bg-gray-50 border-b border-gray-200 text-gray-600">
+              <tr>
+                <th className="text-left px-3 py-2 font-medium">会社名 / URL</th>
+                <th className="text-left px-3 py-2 font-medium w-24">結果</th>
+                <th className="text-left px-3 py-2 font-medium">エラー</th>
+                {job.trackUrlClicks && (
+                  <th className="text-left px-3 py-2 font-medium w-24">URLクリック</th>
+                )}
+                <th className="text-left px-3 py-2 font-medium w-24">送信後画像</th>
+                <th className="text-center px-3 py-2 font-medium w-24">手動送信済</th>
+                <th className="text-left px-3 py-2 font-medium w-56">備考</th>
+                <th className="text-left px-3 py-2 font-medium w-32">登録日時</th>
+                <th className="text-left px-3 py-2 font-medium w-32">実行日時</th>
+                <th className="text-left px-3 py-2 font-medium w-32">更新日時</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filteredResults.length === 0 && (
+                <tr>
+                  <td colSpan={11} className="px-4 py-10 text-center text-gray-500">
+                    該当する結果がありません。
+                  </td>
+                </tr>
+              )}
+              {filteredResults.map((r) => {
+                const b = bucketOf(r.status, r.errorType);
+                return (
+                  <tr key={r.id} className="border-b border-gray-100 hover:bg-gray-50 align-top">
+                    <td className="px-3 py-2 max-w-[260px]">
+                      <div className="truncate">{r.company.name}</div>
+                      <a
+                        href={r.company.formUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-xs text-gray-500 hover:underline truncate block max-w-[240px]"
+                      >
+                        {r.company.formUrl}
+                      </a>
+                    </td>
+                    <td className="px-3 py-2">
+                      <span className={`inline-block text-xs px-2 py-0.5 rounded ${BUCKET_BADGE[b]}`}>
+                        {BUCKET_LABEL[b]}
+                      </span>
+                    </td>
+                    <td className="px-3 py-2 text-xs text-gray-600 max-w-[200px]">
+                      {r.errorType ? (
+                        <span title={r.errorMessage ?? ""} className="truncate block">
+                          {r.errorType}
+                          {r.errorMessage ? ` — ${r.errorMessage.slice(0, 40)}` : ""}
+                        </span>
+                      ) : (
+                        "—"
+                      )}
+                    </td>
+                    {job.trackUrlClicks && (
+                      <td className="px-3 py-2 text-xs">
+                        {r.urlClicks > 0 ? (
+                          <span className="text-green-700 font-semibold">{r.urlClicks} クリック</span>
+                        ) : (
+                          <span className="text-gray-400">未クリック</span>
+                        )}
+                      </td>
+                    )}
+                    <td className="px-3 py-2">
+                      {shotIds.has(r.id) ? (
+                        <a href={`/api/send/screenshot/${r.id}`} target="_blank" rel="noreferrer" title="クリックで拡大表示">
+                          {/* eslint-disable-next-line @next/next/no-img-element */}
+                          <img
+                            src={`/api/send/screenshot/${r.id}`}
+                            alt={`${r.company.name} のスクリーンショット`}
+                            className="h-12 w-20 object-cover object-top border border-gray-200 rounded hover:ring-2 hover:ring-[#1e5ab4]"
+                          />
+                        </a>
+                      ) : (
+                        <span className="text-xs text-gray-400">—</span>
+                      )}
+                    </td>
+                    <td className="px-3 py-2 text-center">
+                      <form action={toggleResultManualSentAction.bind(null, r.id, id)}>
+                        <button
+                          title={r.manualSent ? "手動送信済（クリックで解除）" : "未（クリックで手動送信済に）"}
+                          className={`text-lg leading-none ${r.manualSent ? "" : "opacity-30 grayscale"}`}
+                        >
+                          🚩
+                        </button>
+                      </form>
+                    </td>
+                    <td className="px-3 py-2">
+                      <form action={updateResultNoteAction.bind(null, r.id, id)} className="flex items-center gap-1">
+                        <input
+                          name="note"
+                          defaultValue={r.note ?? ""}
+                          maxLength={500}
+                          placeholder="備考"
+                          className="w-40 border border-gray-300 rounded px-2 py-1 text-xs"
+                        />
+                        <button className="px-2 py-1 rounded border border-gray-300 hover:bg-gray-50 text-xs">
+                          保存
+                        </button>
+                      </form>
+                    </td>
+                    <td className="px-3 py-2 text-xs text-gray-500">{fmtJstDateTime(r.createdAt)}</td>
+                    <td className="px-3 py-2 text-xs text-gray-500">{fmtJstDateTime(r.attemptedAt)}</td>
+                    <td className="px-3 py-2 text-xs text-gray-500">{fmtJstDateTime(r.updatedAt)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function SenderRow({
+  label,
+  children,
+  highlight,
+}: {
+  label: string;
+  children: ReactNode;
+  highlight?: boolean;
+}) {
+  return (
+    <div
+      className={`grid grid-cols-[160px_1fr] items-center px-5 py-3 border-b border-gray-100 ${
+        highlight ? "bg-gray-50" : "bg-white"
+      }`}
+    >
+      <dt className="text-gray-600 font-medium">{label}</dt>
+      <dd className="text-gray-900">{children}</dd>
     </div>
   );
 }

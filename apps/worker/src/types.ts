@@ -14,7 +14,8 @@ export type FormInput = {
   url?: string | null;
   subject?: string | null;
   message?: string | null;
-  position?: string | null;
+  position?: string | null; // 役職
+  department?: string | null; // 部署
 };
 
 export type SubmitResult = {

@@ -24,7 +24,8 @@
     "start": "concurrently -n admin,lp,worker -c blue,green,magenta \"npm:start:admin\" \"npm:start:lp\" \"npm:start:worker\""
   },
   "devDependencies": {
-    "concurrently": "^9.2.1"
+    "concurrently": "^9.2.1",
+    "pm2": "^7.0.1"
   },
   "dependencies": {
     "@prisma/client": "^6.1.0",

@@ -13,11 +13,16 @@ export const dynamic = "force-dynamic";
 
 function buildWhere(sp: URLSearchParams) {
   const where: Record<string, unknown> = {};
+  const and: Record<string, unknown>[] = [];
   const caseId = sp.get("caseId");
+  const jobId = sp.get("jobId");
   const bucket = sp.get("bucket");
+  const rb = sp.getAll("rb").filter((b) => (BUCKET_ORDER as string[]).includes(b));
+  const q = sp.get("q")?.trim();
   const from = sp.get("from");
   const to = sp.get("to");
 
+  if (jobId) where["jobId"] = jobId;
   if (caseId) where["job"] = { caseId };
   if (from || to) {
     where["attemptedAt"] = {
@@ -25,9 +30,18 @@ function buildWhere(sp: URLSearchParams) {
       ...(to ? { lte: new Date(to + "T23:59:59") } : {}),
     };
   }
+  // 単一 bucket (一覧ログ) と複数 rb (ジョブ詳細) の両方に対応
   if (bucket && (BUCKET_ORDER as string[]).includes(bucket)) {
     Object.assign(where, bucketWhere(bucket as ResultBucket));
+  } else if (rb.length > 0) {
+    and.push({ OR: rb.map((b) => bucketWhere(b as ResultBucket)) });
   }
+  if (q) {
+    and.push({
+      company: { OR: [{ name: { contains: q } }, { formUrl: { contains: q } }] },
+    });
+  }
+  if (and.length > 0) where["AND"] = and;
   return where;
 }
 

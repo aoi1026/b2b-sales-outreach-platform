@@ -62,6 +62,7 @@ type FieldRole =
   | "subject"
   | "message"
   | "position"
+  | "department"
   | "company"
   | "company_kana"
   | "url"
@@ -675,8 +676,10 @@ export function detectFieldRole(meta: ElementMeta): FieldRole {
   )
     return "address";
 
-  // 役職 (常に "担当者" 固定)
-  if (/^position$|[_\-]position|position[_\-]|yakushoku|役職|busho|部署|department|dept/.test(idOrName))
+  // 部署 (役職より先に判定。専用値が無ければ役職へフォールバック)
+  if (/busho|bumon|部署|部門|department|dept/.test(idOrName)) return "department";
+  // 役職
+  if (/^position$|[_\-]position|position[_\-]|yakushoku|役職/.test(idOrName))
     return "position";
 
   // 件名
@@ -703,7 +706,8 @@ export function detectFieldRole(meta: ElementMeta): FieldRole {
   if (/会社|法人|団体|company|organization|organisation|corporation/i.test(combined))
     return "company";
   if (/フリガナ|ふりがな|カナ|kana/i.test(combined)) return "person_kana";
-  if (/役職|position|部署|department/i.test(combined)) return "position";
+  if (/部署|部門|department/i.test(combined)) return "department";
+  if (/役職|position/i.test(combined)) return "position";
   if (/問い?合わ?せ|内容|message|comment|inquiry|body|質問|相談|備考|要望/i.test(combined))
     return "message";
   if (/氏名|お名前|担当者|氏|name/i.test(combined)) return "person";
@@ -771,6 +775,9 @@ export function pickValueForRole(role: FieldRole, input: FormInput): string | nu
       return input.message ?? null;
     case "position":
       return input.position ?? "担当者";
+    case "department":
+      // 部署: 専用値が無ければ役職、それも無ければ "担当者"。
+      return input.department ?? input.position ?? "担当者";
     case "company":
       return input.company ?? null;
     case "company_kana":

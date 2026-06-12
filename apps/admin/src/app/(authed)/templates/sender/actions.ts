@@ -9,42 +9,78 @@ import { requireUser } from "@/lib/auth";
 const schema = z.object({
   name: z.string().min(1).max(120),
   companyName: z.string().min(1).max(200),
-  personName: z.string().min(1).max(120),
-  personHiragana: z.string().max(120).optional(),
-  personKatakana: z.string().max(120).optional(),
+  familyName: z.string().max(60).optional(),
+  givenName: z.string().max(60).optional(),
+  familyNameKana: z.string().max(60).optional(),
+  givenNameKana: z.string().max(60).optional(),
+  department: z.string().max(100).optional(),
+  position: z.string().max(100).optional(),
   email: z.string().email().max(200),
   phone: z.string().max(40).optional(),
   postalCode: z.string().max(20).optional(),
-  address: z.string().max(300).optional(),
+  prefecture: z.string().max(20).optional(),
+  city: z.string().max(100).optional(),
+  addressLine: z.string().max(120).optional(),
+  building: z.string().max(120).optional(),
   url: z.string().url().max(500).optional().or(z.literal("")),
 });
+
+const str = (formData: FormData, key: string) =>
+  formData.get(key)?.toString() || undefined;
 
 function parse(formData: FormData) {
   return schema.safeParse({
     name: formData.get("name")?.toString() ?? "",
     companyName: formData.get("companyName")?.toString() ?? "",
-    personName: formData.get("personName")?.toString() ?? "",
-    personHiragana: formData.get("personHiragana")?.toString() || undefined,
-    personKatakana: formData.get("personKatakana")?.toString() || undefined,
+    familyName: str(formData, "familyName"),
+    givenName: str(formData, "givenName"),
+    familyNameKana: str(formData, "familyNameKana"),
+    givenNameKana: str(formData, "givenNameKana"),
+    department: str(formData, "department"),
+    position: str(formData, "position"),
     email: formData.get("email")?.toString() ?? "",
-    phone: formData.get("phone")?.toString() || undefined,
-    postalCode: formData.get("postalCode")?.toString() || undefined,
-    address: formData.get("address")?.toString() || undefined,
+    phone: str(formData, "phone"),
+    postalCode: str(formData, "postalCode"),
+    prefecture: str(formData, "prefecture"),
+    city: str(formData, "city"),
+    addressLine: str(formData, "addressLine"),
+    building: str(formData, "building"),
     url: formData.get("url")?.toString() ?? "",
   });
 }
 
+// 半角/全角スペース区切りで結合 (空要素は除く)
+const join = (...parts: (string | undefined)[]) =>
+  parts.map((p) => p?.trim()).filter(Boolean).join(" ") || null;
+
 function normalize(d: z.infer<typeof schema>) {
+  const personName = join(d.familyName, d.givenName) ?? d.name; // 後方互換 (非null列)
+  const personKatakana = join(d.familyNameKana, d.givenNameKana);
+  const address =
+    [d.prefecture, d.city, d.addressLine, d.building]
+      .map((p) => p?.trim())
+      .filter(Boolean)
+      .join("") || null; // 結合住所 (後方互換 / フォーム住所欄用)
   return {
     name: d.name,
     companyName: d.companyName,
-    personName: d.personName,
-    personHiragana: d.personHiragana || null,
-    personKatakana: d.personKatakana || null,
+    personName,
+    familyName: d.familyName || null,
+    givenName: d.givenName || null,
+    familyNameKana: d.familyNameKana || null,
+    givenNameKana: d.givenNameKana || null,
+    personHiragana: null,
+    personKatakana,
+    department: d.department || null,
+    position: d.position || null,
     email: d.email,
     phone: d.phone || null,
     postalCode: d.postalCode || null,
-    address: d.address || null,
+    prefecture: d.prefecture || null,
+    city: d.city || null,
+    addressLine: d.addressLine || null,
+    building: d.building || null,
+    address,
     url: d.url || null,
   };
 }
@@ -91,11 +127,21 @@ export async function duplicateSenderTemplateAction(id: string): Promise<void> {
       name: `${src.name} (コピー)`,
       companyName: src.companyName,
       personName: src.personName,
+      familyName: src.familyName,
+      givenName: src.givenName,
       personHiragana: src.personHiragana,
       personKatakana: src.personKatakana,
+      familyNameKana: src.familyNameKana,
+      givenNameKana: src.givenNameKana,
+      department: src.department,
+      position: src.position,
       email: src.email,
       phone: src.phone,
       postalCode: src.postalCode,
+      prefecture: src.prefecture,
+      city: src.city,
+      addressLine: src.addressLine,
+      building: src.building,
       address: src.address,
       url: src.url,
     },
