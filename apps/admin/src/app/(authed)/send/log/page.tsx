@@ -12,6 +12,7 @@ import {
   formatRatePct,
   type ResultBucket,
 } from "@/lib/delivery-stats";
+import { errorTypeLabel } from "@/lib/delivery-status";
 import { fmtJstDateTime } from "@/lib/date-jst";
 
 export const dynamic = "force-dynamic";
@@ -115,52 +116,39 @@ export default async function SendLogPage({
             <div className="text-sm text-gray-600 pb-1 leading-relaxed">
               <div>
                 成功 <span className="font-semibold text-green-700">{summary.successCount.toLocaleString()}</span> 件
-                {" / "}
-                有効送信 <span className="font-semibold">{summary.validCount.toLocaleString()}</span> 件
               </div>
               <div className="text-xs text-gray-500">
                 送信処理 合計 {summary.total.toLocaleString()} 件
               </div>
             </div>
           </div>
-          <div className="text-[11px] text-gray-500 md:text-right md:max-w-xs leading-relaxed">
-            成功率 ＝ 成功 ÷（成功 ＋ 失敗）×100
-            <br />
-            営業拒否・フォームなし・送信不可・キャンセルは「送信不可／未送信」として分母から除外しています。
-          </div>
         </div>
       </div>
 
       {/* 分類別件数 (クリックで絞り込み) */}
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-5">
-        {BUCKETS.map((b) => {
-          const inDenominator = b === "SUCCESS" || b === "FAILED";
-          return (
-            <Link
-              key={b}
-              href={{
-                query: {
-                  ...(caseId ? { caseId } : {}),
-                  ...(from ? { from } : {}),
-                  ...(to ? { to } : {}),
-                  bucket: b,
-                },
-              }}
-              className={`rounded border p-3 hover:shadow transition ${
-                bucket === b ? "border-[#1e5ab4] ring-1 ring-[#1e5ab4]" : "border-gray-200"
-              }`}
-            >
-              <div className="flex items-center gap-1.5">
-                <span className={`inline-block w-2 h-2 rounded-full ${BUCKET_BADGE[b].split(" ")[0]}`} />
-                <span className="text-xs text-gray-500">{BUCKET_LABEL[b]}</span>
-              </div>
-              <div className="mt-1 text-xl font-semibold">{bucketCounts[b].toLocaleString()}</div>
-              <div className="text-[10px] text-gray-400">
-                {inDenominator ? "分母に算入" : "分母から除外"}
-              </div>
-            </Link>
-          );
-        })}
+        {BUCKETS.map((b) => (
+          <Link
+            key={b}
+            href={{
+              query: {
+                ...(caseId ? { caseId } : {}),
+                ...(from ? { from } : {}),
+                ...(to ? { to } : {}),
+                bucket: b,
+              },
+            }}
+            className={`rounded border p-3 hover:shadow transition ${
+              bucket === b ? "border-[#1e5ab4] ring-1 ring-[#1e5ab4]" : "border-gray-200"
+            }`}
+          >
+            <div className="flex items-center gap-1.5">
+              <span className={`inline-block w-2 h-2 rounded-full ${BUCKET_BADGE[b].split(" ")[0]}`} />
+              <span className="text-xs text-gray-500">{BUCKET_LABEL[b]}</span>
+            </div>
+            <div className="mt-1 text-xl font-semibold">{bucketCounts[b].toLocaleString()}</div>
+          </Link>
+        ))}
       </div>
 
       <form className="bg-white rounded border border-gray-200 p-4 mb-5 grid grid-cols-1 md:grid-cols-5 gap-3 text-sm">
@@ -267,10 +255,7 @@ export default async function SendLogPage({
                   </td>
                   <td className="px-3 py-2 text-xs text-gray-600 truncate max-w-[260px]">
                     {r.errorType ? (
-                      <span title={r.errorMessage ?? ""}>
-                        {r.errorType}
-                        {r.errorMessage ? ` — ${r.errorMessage.slice(0, 60)}` : ""}
-                      </span>
+                      <span title={r.errorMessage ?? ""}>{errorTypeLabel(r.errorType)}</span>
                     ) : (
                       "—"
                     )}

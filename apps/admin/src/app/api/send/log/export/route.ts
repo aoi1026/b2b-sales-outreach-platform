@@ -7,6 +7,7 @@ import {
   BUCKET_ORDER,
   type ResultBucket,
 } from "@/lib/delivery-stats";
+import { errorTypeLabel } from "@/lib/delivery-status";
 import { fmtJstDate, fmtJstDateTime } from "@/lib/date-jst";
 
 export const dynamic = "force-dynamic";
@@ -95,7 +96,7 @@ export async function GET(req: Request) {
           r.company.formUrl,
           BUCKET_LABEL[bucketOf(r.status, r.errorType)],
           r.status,
-          r.errorType ?? "",
+          errorTypeLabel(r.errorType),
           r.errorMessage ?? "",
           r.attempts,
           r.httpStatus ?? "",

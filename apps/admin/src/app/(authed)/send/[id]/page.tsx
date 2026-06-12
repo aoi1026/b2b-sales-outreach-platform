@@ -3,7 +3,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import Breadcrumbs from "@/components/Breadcrumbs";
 import { prisma } from "@/lib/db";
-import { JOB_STATUS_BADGE, JOB_STATUS_LABEL } from "@/lib/delivery-status";
+import { JOB_STATUS_BADGE, JOB_STATUS_LABEL, errorTypeLabel } from "@/lib/delivery-status";
 import {
   bucketOf,
   emptyBucketCounts,
@@ -269,9 +269,7 @@ export default async function SendJobDetailPage({
             <div className="text-3xl font-bold tracking-tight text-green-700">
               {formatRatePct(jobSummary.successRate)}
             </div>
-            <div className="text-[11px] text-gray-500 mt-1">
-              成功 {jobSummary.successCount} ／ 有効送信 {jobSummary.validCount}（成功＋失敗）
-            </div>
+            <div className="text-[11px] text-gray-500 mt-1">成功 {jobSummary.successCount} 件</div>
           </div>
           <div className="flex flex-wrap gap-2">
             {BUCKET_ORDER.map((b) => (
@@ -297,9 +295,6 @@ export default async function SendJobDetailPage({
           />
         </div>
         <div className="mt-1 text-xs text-gray-500 text-right">進捗 {progressPct}%</div>
-        <p className="mt-2 text-[11px] text-gray-400">
-          成功率 ＝ 成功 ÷（成功 ＋ 失敗）×100。営業拒否・フォームなし・送信不可・キャンセルは分母から除外。
-        </p>
       </section>
 
       {job.trackUrlClicks && (
@@ -449,8 +444,7 @@ export default async function SendJobDetailPage({
                     <td className="px-3 py-2 text-xs text-gray-600 max-w-[200px]">
                       {r.errorType ? (
                         <span title={r.errorMessage ?? ""} className="truncate block">
-                          {r.errorType}
-                          {r.errorMessage ? ` — ${r.errorMessage.slice(0, 40)}` : ""}
+                          {errorTypeLabel(r.errorType)}
                         </span>
                       ) : (
                         "—"

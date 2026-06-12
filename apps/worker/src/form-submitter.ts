@@ -1927,9 +1927,7 @@ function applyCaptchaClassification(
   if (result.status !== "failed" || !detected) return result;
   if (result.errorType !== "VALIDATION_ERROR" && result.errorType !== "UNKNOWN") return result;
   result.errorType = "CAPTCHA_FAILED";
-  result.errorMessage = tokenInjected
-    ? "CAPTCHA を検出しトークンを注入しましたが、送信が拒否されました（スコア不足/検証失敗の可能性）。"
-    : "CAPTCHA を検出しましたが、解決トークンを取得できず送信できませんでした。";
+  result.errorMessage = "問い合わせ受付を許可しないフォームのため送信できませんでした。";
   return result;
 }
 

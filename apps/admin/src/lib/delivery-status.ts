@@ -34,6 +34,24 @@ export const RESULT_STATUS_BADGE: Record<DeliveryResultStatus, string> = {
   SKIPPED: "bg-gray-200 text-gray-600",
 };
 
+// エラー種別の表示ラベル (生の enum 名を画面・CSV に出さない)。
+export const ERROR_TYPE_LABEL: Record<string, string> = {
+  TIMEOUT: "タイムアウト",
+  FORM_NOT_FOUND: "フォーム未検出",
+  FIELD_MISMATCH: "項目不一致",
+  SUBMIT_FAILED: "送信失敗",
+  VALIDATION_ERROR: "入力内容エラー",
+  CAPTCHA_FAILED: "問い合わせ受付を許可しません",
+  BLACKLISTED: "送信対象外",
+  NETWORK_ERROR: "ネットワークエラー",
+  UNKNOWN: "不明なエラー",
+};
+
+export function errorTypeLabel(errorType?: string | null): string {
+  if (!errorType) return "";
+  return ERROR_TYPE_LABEL[errorType] ?? errorType;
+}
+
 // 暫定成功 (送信ボタンは押下したが完了を確認できなかった) は status=SUCCESS のまま
 // errorType=UNKNOWN を持つ。表示は「成功-」とし、バッジ色は通常の成功と全く同じにする。
 export function resultStatusLabel(

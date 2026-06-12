@@ -2,6 +2,13 @@ import Link from "next/link";
 import Breadcrumbs from "@/components/Breadcrumbs";
 import { prisma } from "@/lib/db";
 import { JOB_STATUS_BADGE, JOB_STATUS_LABEL } from "@/lib/delivery-status";
+import {
+  bucketOf,
+  emptyBucketCounts,
+  summarizeRate,
+  formatRatePct,
+  type BucketCounts,
+} from "@/lib/delivery-stats";
 import { fmtJstDate } from "@/lib/date-jst";
 import DeleteJobButton from "./DeleteJobButton";
 
@@ -17,6 +24,23 @@ export default async function SendJobsPage() {
       messageTemplate: true,
     },
   });
+
+  // 各ジョブの成功率 = 成功 ÷ (成功 + 失敗) を実際の分類から算出。
+  // (job.failedCount はフォームなし/送信不可も含む粗い値なので使わない)
+  const jobIds = jobs.map((j) => j.id);
+  const grouped = jobIds.length
+    ? await prisma.deliveryResult.groupBy({
+        by: ["jobId", "status", "errorType"],
+        where: { jobId: { in: jobIds } },
+        _count: true,
+      })
+    : [];
+  const countsByJob = new Map<string, BucketCounts>();
+  for (const g of grouped) {
+    const c = countsByJob.get(g.jobId) ?? emptyBucketCounts();
+    c[bucketOf(g.status, g.errorType)] += g._count;
+    countsByJob.set(g.jobId, c);
+  }
 
   return (
     <div>
@@ -41,6 +65,7 @@ export default async function SendJobsPage() {
               <th className="text-left px-4 py-2 font-medium">テンプレ</th>
               <th className="text-left px-4 py-2 font-medium">ステータス</th>
               <th className="text-left px-4 py-2 font-medium">進捗</th>
+              <th className="text-left px-4 py-2 font-medium w-24">成功率</th>
               <th className="text-left px-4 py-2 font-medium w-28">作成日</th>
               <th className="text-left px-4 py-2 font-medium w-20">操作</th>
             </tr>
@@ -48,13 +73,14 @@ export default async function SendJobsPage() {
           <tbody>
             {jobs.length === 0 && (
               <tr>
-                <td colSpan={8} className="px-4 py-10 text-center text-gray-500">
+                <td colSpan={9} className="px-4 py-10 text-center text-gray-500">
                   ジョブがまだありません。右上の「＋ 新規ジョブ」から作成してください。
                 </td>
               </tr>
             )}
             {jobs.map((j) => {
               const processed = j.successCount + j.failedCount + j.skippedCount;
+              const sum = summarizeRate(countsByJob.get(j.id) ?? emptyBucketCounts());
               return (
                 <tr key={j.id} className="border-b border-gray-100 hover:bg-gray-50">
                   <td className="px-4 py-3 font-mono text-xs">
@@ -74,6 +100,11 @@ export default async function SendJobsPage() {
                     {processed} / {j.plannedCount}
                     <span className="text-gray-500 ml-2">
                       (成功 {j.successCount} / 失敗 {j.failedCount} / スキップ {j.skippedCount})
+                    </span>
+                  </td>
+                  <td className="px-4 py-3 whitespace-nowrap">
+                    <span className="font-semibold text-green-700">
+                      {formatRatePct(sum.successRate)}
                     </span>
                   </td>
                   <td className="px-4 py-3 text-gray-500 whitespace-nowrap">
