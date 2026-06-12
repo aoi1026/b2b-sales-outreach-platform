@@ -366,12 +366,15 @@ export async function processDeliveryJob(
     // フォールバック再送をスキップする。バリデーション/不明/送信失敗のときだけ短文で再送。
     const FALLBACK_RETRYABLE = new Set(["VALIDATION_ERROR", "UNKNOWN", "SUBMIT_FAILED"]);
     // AI 解析はフォーム構造そのものの取りこぼしにも効くため、対象を少し広げる。
+    // TIMEOUT も対象に含める (ページが重く既存ロジックが時間切れになった場合でも、
+    // 残り時間があれば AI による再読込・再送で成功できることがある)。
     const AI_RETRYABLE = new Set([
       "VALIDATION_ERROR",
       "UNKNOWN",
       "SUBMIT_FAILED",
       "FORM_NOT_FOUND",
       "FIELD_MISMATCH",
+      "TIMEOUT",
     ]);
 
     const aiOpts = () => ({

@@ -156,6 +156,8 @@ model SenderTemplate {
   givenName      String?  @map("given_name") // 名
   personHiragana String?  @map("person_hiragana")
   personKatakana String?  @map("person_katakana")
+  familyNameHira String?  @map("family_name_hira") // 姓 (ひらがな)
+  givenNameHira  String?  @map("given_name_hira") // 名 (ひらがな)
   familyNameKana String?  @map("family_name_kana") // 姓 (カナ)
   givenNameKana  String?  @map("given_name_kana") // 名 (カナ)
   department     String?  @map("department") // 部署

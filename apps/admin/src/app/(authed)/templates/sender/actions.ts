@@ -11,6 +11,8 @@ const schema = z.object({
   companyName: z.string().min(1).max(200),
   familyName: z.string().max(60).optional(),
   givenName: z.string().max(60).optional(),
+  familyNameHira: z.string().max(60).optional(),
+  givenNameHira: z.string().max(60).optional(),
   familyNameKana: z.string().max(60).optional(),
   givenNameKana: z.string().max(60).optional(),
   department: z.string().max(100).optional(),
@@ -34,6 +36,8 @@ function parse(formData: FormData) {
     companyName: formData.get("companyName")?.toString() ?? "",
     familyName: str(formData, "familyName"),
     givenName: str(formData, "givenName"),
+    familyNameHira: str(formData, "familyNameHira"),
+    givenNameHira: str(formData, "givenNameHira"),
     familyNameKana: str(formData, "familyNameKana"),
     givenNameKana: str(formData, "givenNameKana"),
     department: str(formData, "department"),
@@ -55,6 +59,7 @@ const join = (...parts: (string | undefined)[]) =>
 
 function normalize(d: z.infer<typeof schema>) {
   const personName = join(d.familyName, d.givenName) ?? d.name; // 後方互換 (非null列)
+  const personHiragana = join(d.familyNameHira, d.givenNameHira);
   const personKatakana = join(d.familyNameKana, d.givenNameKana);
   const address =
     [d.prefecture, d.city, d.addressLine, d.building]
@@ -67,9 +72,11 @@ function normalize(d: z.infer<typeof schema>) {
     personName,
     familyName: d.familyName || null,
     givenName: d.givenName || null,
+    familyNameHira: d.familyNameHira || null,
+    givenNameHira: d.givenNameHira || null,
     familyNameKana: d.familyNameKana || null,
     givenNameKana: d.givenNameKana || null,
-    personHiragana: null,
+    personHiragana,
     personKatakana,
     department: d.department || null,
     position: d.position || null,
@@ -129,6 +136,8 @@ export async function duplicateSenderTemplateAction(id: string): Promise<void> {
       personName: src.personName,
       familyName: src.familyName,
       givenName: src.givenName,
+      familyNameHira: src.familyNameHira,
+      givenNameHira: src.givenNameHira,
       personHiragana: src.personHiragana,
       personKatakana: src.personKatakana,
       familyNameKana: src.familyNameKana,

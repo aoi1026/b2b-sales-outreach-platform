@@ -2261,6 +2261,7 @@ function inputToFillValues(input: FormInput) {
     subject: input.subject ?? null,
     message: input.message ?? null,
     position: input.position ?? null,
+    department: input.department ?? null,
   };
 }
 

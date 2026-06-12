@@ -4,9 +4,9 @@ import Anthropic from "@anthropic-ai/sdk";
 // どのボタンをどの順で押し、何をもって成功とするか）を生成する。
 // ANTHROPIC_API_KEY が無ければ無効 (null を返す)。
 
-// フォーム項目→送信プランの生成は構造化抽出タスクで Opus は過剰。Haiku で十分かつ
-// コストは約 1/15。これにより少額のクレジットでも多数のフォームを処理できる。
-const MODEL = "claude-haiku-4-5-20251001";
+// 難フォームの解析・送信プラン生成は精度が成功率に直結するため Sonnet 4.6 を使用する。
+// (Haiku 4.5 は adaptive thinking / effort 非対応で精度も劣るため、ここでは採用しない)
+const MODEL = "claude-sonnet-4-6";
 
 let client: Anthropic | null = null;
 function getClient(): Anthropic | null {
@@ -52,7 +52,8 @@ export type FillValues = {
   url?: string | null;
   subject?: string | null;
   message?: string | null;
-  position?: string | null;
+  position?: string | null; // 役職
+  department?: string | null; // 部署
 };
 
 export type FillAction = {
@@ -110,6 +111,8 @@ const SYSTEM_PROMPT = `あなたは日本語のお問い合わせフォーム自
     「セイ/メイ」ならカタカナを要求している。フリガナ欄が姓/名に分かれている場合も
     上記と同様に分割する。
 - メールアドレス確認欄 (email2 / mail_confirm 等) には email と同じ値を fill する。
+- 部署欄 (部署 / 部門 / department / busho) には department を fill する。department が無ければ position を使う。
+  役職欄 (役職 / position / yakushoku) には position を fill する。部署と役職は別項目なので取り違えない。
 - 文字種の指定 (全角/半角) を守る。ラベルやプレースホルダ・スクリーンショットに「全角」と
   ある欄 (氏名・フリガナ・住所など) は、半角スペース・半角英数・半角記号をすべて全角に変換して
   入力する (例: 住所の半角スペースやカンマは全角に)。逆に「半角」指定 (メール・電話・郵便番号・
@@ -144,6 +147,7 @@ function valuesToText(v: FillValues): string {
   push("URL (url)", v.url);
   push("件名 (subject)", v.subject);
   push("本文 (message)", v.message);
+  push("部署 (department)", v.department);
   push("役職 (position)", v.position);
   return rows.join("\n");
 }
@@ -192,7 +196,8 @@ export async function generateFillPlan(args: {
   try {
     const res = await anthropic.messages.create({
       model: MODEL,
-      max_tokens: 4096,
+      max_tokens: 8192,
+      // Sonnet 4.6 は adaptive thinking と effort に対応。難フォームの推論精度を上げる。
       thinking: { type: "adaptive" },
       output_config: {
         effort: "medium",

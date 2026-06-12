@@ -8,6 +8,8 @@ type Defaults = {
   personName: string;
   familyName: string | null;
   givenName: string | null;
+  familyNameHira: string | null;
+  givenNameHira: string | null;
   familyNameKana: string | null;
   givenNameKana: string | null;
   personHiragana: string | null;
@@ -56,6 +58,8 @@ export default function SenderTemplateForm({
         <Field label="役職" name="position" required defaultValue={defaults?.position ?? ""} maxLength={100} placeholder="一般 / 担当者" />
         <Field label="姓" name="familyName" required defaultValue={defaults?.familyName ?? ""} maxLength={60} placeholder="依田" />
         <Field label="名" name="givenName" required defaultValue={defaults?.givenName ?? ""} maxLength={60} placeholder="優真" />
+        <Field label="姓 (ひらがな)" name="familyNameHira" defaultValue={defaults?.familyNameHira ?? ""} maxLength={60} placeholder="よだ" />
+        <Field label="名 (ひらがな)" name="givenNameHira" defaultValue={defaults?.givenNameHira ?? ""} maxLength={60} placeholder="ゆうま" />
         <Field label="姓 (カナ)" name="familyNameKana" required defaultValue={defaults?.familyNameKana ?? ""} maxLength={60} placeholder="ヨダ" />
         <Field label="名 (カナ)" name="givenNameKana" required defaultValue={defaults?.givenNameKana ?? ""} maxLength={60} placeholder="ユウマ" />
         <Field label="メールアドレス" name="email" type="email" required defaultValue={defaults?.email} maxLength={200} placeholder="yoda@example.co.jp" />
