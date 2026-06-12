@@ -193,5 +193,12 @@ console.log("\n=== 会社名フリガナ → company_kana (htm-consul) ===");
 eq("貴社名フリガナ role", detectFieldRole(meta({ name: "kana01", labelText: "貴社名フリガナ" })), "company_kana");
 eq("お名前フリガナ → person", detectFieldRole(meta({ name: "kana02", labelText: "お名前フリガナ" })) === "company_kana", false);
 
+console.log("\n=== 連番サフィックス姓名 (shiseido cu_name1/2, cu_ename1/2) ===");
+eq("cu_name1 → person_last", detectFieldRole(meta({ name: "cu_name1", labelText: "お名前（漢字）" })), "person_last");
+eq("cu_name2 → person_first", detectFieldRole(meta({ name: "cu_name2", labelText: "お名前（漢字）" })), "person_first");
+eq("cu_ename1 → hiragana_last", detectFieldRole(meta({ name: "cu_ename1", labelText: "お名前（かな）" })), "person_hiragana_last");
+eq("cu_ename2 → hiragana_first", detectFieldRole(meta({ name: "cu_ename2", labelText: "お名前（かな）" })), "person_hiragana_first");
+eq("company_name1 not person_last", detectFieldRole(meta({ name: "company_name1" })) === "person_last", false);
+
 console.log(`\n${fail === 0 ? "🎉 ALL PASS" : "💥 FAILURES"}: ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

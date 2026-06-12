@@ -493,6 +493,23 @@ async function getElementMeta(_page: Page, el: ElementHandle<Element>) {
           sib = sib.previousSibling;
         }
       }
+      if (!labelText) {
+        // 1行に複数入力 (姓[input]名[input]) があり inputCount<=1 行が見つからない場合でも、
+        // 近傍の <th>/見出しを「行ラベル」として採用する。文字種ヒント (漢字/かな/カナ) を
+        // 拾えるようにする (例: shiseido の「お名前（かな）」見出し)。
+        let a2: Element | null = e.parentElement;
+        for (let hop = 0; a2 && hop < 5 && !labelText; hop++) {
+          const th = a2.querySelector("th, dt, legend");
+          if (th && !th.querySelector("input, select, textarea")) {
+            const t = (th.textContent || "")
+              .replace(/[\s　]+/g, " ")
+              .replace(/[*＊※]|必須|任意|required|optional/gi, "")
+              .trim();
+            if (t.length >= 1 && t.length <= 30) labelText = t;
+          }
+          a2 = a2.parentElement;
+        }
+      }
       return {
         name: e.getAttribute("name") || "",
         id: idv,
@@ -621,22 +638,32 @@ export function detectFieldRole(meta: ElementMeta): FieldRole {
     const lbl = meta.labelText || "";
     const lastByLabel = /^(?:姓|セイ|せい)(?:\s|　|（|\(|:|：|$)/.test(lbl);
     const firstByLabel = /^(?:名|メイ|めい)(?:\s|　|（|\(|:|：|$)/.test(lbl);
+    // 連番サフィックス型 (cu_name1/cu_name2, name1/name2, kana1/kana2, ename1/ename2 等):
+    // 「氏名/かな」を意味するステム + 末尾 1=姓 / 2=名。会社名 (company_name1 等) は除外。
+    const nameStem = /(?:name|namae|なまえ|お?名前|氏名|kana|furigana|フリガナ|sei|mei|yomi)/i;
+    // 会社名/貴社名のフリガナ欄 (label に会社ヒスト) は除外し、後段の company_kana に任せる。
+    const notCompany = !/(?:company|corp|会社|貴社|御社|法人|団体|店舗|shop)/i.test(`${idOrName}|${combined}`);
+    const numName1 = nameStem.test(idOrName) && /1(?:\||$)/.test(idOrName) && notCompany;
+    const numName2 = nameStem.test(idOrName) && /2(?:\||$)/.test(idOrName) && notCompany;
     const partLast =
       /(?:^|[_\-])last[_\-]?name|lastname|(?:^|[_\-])sei(?:[_\-]|$)|name[_\-]?sei|family[_\-]?name|surname|姓|myoji|苗字|名字/.test(idOrName) ||
       lastToken ||
       lastByLabel ||
+      numName1 ||
       /(?:^|[^ぁ-ゖ])せい(?:[^ぁ-ゖ]|$)|セイ|^\s*姓\s*$/.test(ph);
     const partFirst =
       /(?:^|[_\-])first[_\-]?name|firstname|(?:^|[_\-])mei(?:[_\-]|$)|name[_\-]?mei|given[_\-]?name/.test(idOrName) ||
       firstToken ||
       firstByLabel ||
+      numName2 ||
       /(?:^|[^ぁ-ゖ])めい(?:[^ぁ-ゖ]|$)|メイ|^\s*名\s*$/.test(ph);
     if (partLast || partFirst) {
+      // 「かな」(ひらがな表記) 単独もひらがな扱い。「カナ/フリガナ」(カタカナ表記) はカタカナ。
       const hira =
         /hira(?:gana)?|ひらがな/.test(idOrName) ||
         /(?:^|\|)(?:せい|めい)(?:\||$)/.test(idOrName) || // name="せい"/"めい"
         /^(?:せい|めい)(?:\s|　|（|\(|:|：|$)/.test(lbl) || // ラベルが「せい」「めい」
-        /ひらがな|ふりがな/.test(combined) ||
+        /ひらがな|ふりがな|かな/.test(combined) ||
         /(?:^|[^ぁ-ゖ])(?:せい|めい)(?:[^ぁ-ゖ]|$)/.test(ph);
       const kata =
         !hira &&
@@ -1126,6 +1153,114 @@ async function fillSplitGroups(
   return consumedNames;
 }
 
+// 「お名前/氏名/フリガナ」見出しの行に、姓/名 を区別する個別ラベルが無い text input が
+// ちょうど2つ並ぶフォーム (例: shiseido は「お名前(漢字)」の下に空欄2つ) を、位置で
+// [0]=姓 / [1]=名 に振り分けて充填する。行ラベルの文字種で漢字/カナ/ひらがなを判定。
+async function fillPositionalNameGroups(
+  page: Page,
+  form: ElementHandle<Element>,
+  input: FormInput,
+): Promise<Set<string>> {
+  const consumed = new Set<string>();
+  type Grp = { kind: "kanji" | "kata" | "hira"; names: string[]; ids: string[] };
+  const groups: Grp[] = await form
+    .evaluate((formEl) => {
+      const SKIP = new Set([
+        "hidden",
+        "checkbox",
+        "radio",
+        "submit",
+        "button",
+        "file",
+        "image",
+        "reset",
+      ]);
+      const NAME_LABEL = /お名前|氏名|ご芳名|お客様名|担当者名|ご担当者|name/i;
+      const KANA = /フリガナ|カナ|カタカナ/;
+      const HIRA = /ふりがな|ひらがな/;
+      const INDIV = /姓|名|セイ|メイ|せい|めい|sei|mei|last|first|family|given|苗字|名字/i;
+      const out: { kind: "kanji" | "kata" | "hira"; names: string[]; ids: string[] }[] = [];
+      const seen = new Set<Element>();
+      const rows = Array.from(
+        formEl.querySelectorAll("tr, dd, li, p, div, fieldset, td"),
+      );
+      for (const row of rows) {
+        const inputs = Array.from(row.querySelectorAll("input")).filter((i) => {
+          const t = (i.getAttribute("type") || "text").toLowerCase();
+          return !SKIP.has(t);
+        });
+        if (inputs.length !== 2) continue;
+        if (inputs.some((i) => seen.has(i))) continue;
+        const labelText = row.textContent || "";
+        if (!NAME_LABEL.test(labelText)) continue;
+        // 個別に姓/名 を示す手掛かりがある input は対象外 (既存の per-field ロジックに任せる)
+        const indiv = inputs.map((i) => {
+          const around =
+            (i.getAttribute("name") || "") +
+            "|" +
+            (i.getAttribute("id") || "") +
+            "|" +
+            (i.getAttribute("placeholder") || "") +
+            "|" +
+            (i.previousSibling && i.previousSibling.textContent
+              ? i.previousSibling.textContent
+              : "");
+          return INDIV.test(around);
+        });
+        if (indiv[0] || indiv[1]) continue;
+        const kind = HIRA.test(labelText) ? "hira" : KANA.test(labelText) ? "kata" : "kanji";
+        inputs.forEach((i) => seen.add(i));
+        out.push({
+          kind,
+          names: inputs.map((i) => i.getAttribute("name") || ""),
+          ids: inputs.map((i) => i.getAttribute("id") || ""),
+        });
+      }
+      return out;
+    })
+    .catch(() => [] as Grp[]);
+
+  for (const g of groups) {
+    let last: string | null;
+    let first: string | null;
+    if (g.kind === "kata") {
+      const s = splitNameParts(input.personKatakana ?? input.personKana);
+      last = stripSpaces(s.last);
+      first = stripSpaces(s.first);
+    } else if (g.kind === "hira") {
+      const s = splitNameParts(input.personHiragana);
+      last = stripSpaces(s.last);
+      first = stripSpaces(s.first);
+    } else {
+      last = input.personLast ?? splitNameParts(input.person).last;
+      first = input.personFirst ?? splitNameParts(input.person).first;
+    }
+    for (let i = 0; i < 2; i++) {
+      const val = i === 0 ? last : first;
+      if (!val) continue;
+      const id = g.ids[i];
+      const name = g.names[i];
+      const sel = id
+        ? `#${cssEscape(id)}`
+        : name
+          ? `input[name="${name.replace(/(["\\])/g, "\\$1")}"]`
+          : null;
+      if (!sel) continue;
+      const el = await form.$(sel).catch(() => null);
+      if (el) {
+        await safeFill(el, val);
+        if (name) consumed.add(name);
+      }
+    }
+  }
+  return consumed;
+}
+
+// CSS.escape は Node 側には無いので最小の id エスケープ (英数_- 以外を \ でエスケープ)。
+function cssEscape(id: string): string {
+  return id.replace(/([^a-zA-Z0-9_-])/g, "\\$1");
+}
+
 // ============= Select handling =============
 
 // 同意/必須チェックボックスと判定するキーワード (name/id/label 共通)。
@@ -1171,17 +1306,45 @@ async function applyChoiceDefaults(
   form: ElementHandle<Element>,
 ): Promise<void> {
   // ---- <select> ----
+  // 「選択してください」等のプレースホルダは value が空とは限らず value="0"/"選択してください"
+  // のように非空のこともある (例: htm-consul の 業種/仕事内容)。option テキストや index でも
+  // プレースホルダ判定し、実値が未選択なら必ず2番目以降の有効 option を選ぶ。
+  const PLACEHOLDER_RE =
+    /選択して|お選び|選んで|指定して|お問い合わせ|未選択|どちら|please\s*select|select|choose|^[\s　ー―\-=*]*$/i;
   for (const sel of await form.$$("select")) {
     try {
-      const cur = await sel.evaluate((n) => (n as HTMLSelectElement).value);
-      if (cur && cur.trim() !== "") continue; // 既に選択済み
+      const state = await sel.evaluate((n) => {
+        const s = n as HTMLSelectElement;
+        const opt = s.options[s.selectedIndex];
+        return {
+          value: s.value,
+          text: (opt?.textContent ?? "").trim(),
+          idx: s.selectedIndex,
+        };
+      });
+      const isPlaceholder =
+        state.value.trim() === "" ||
+        state.idx <= 0 ||
+        /^(0|選択|未選択)$/.test(state.value.trim()) ||
+        PLACEHOLDER_RE.test(state.text);
+      if (!isPlaceholder) continue; // 実値が選択済み
       const options = await sel.$$eval("option", (opts) =>
-        (opts as HTMLOptionElement[]).map((o) => ({ value: o.value, disabled: o.disabled })),
+        (opts as HTMLOptionElement[]).map((o, i) => ({
+          index: i,
+          value: o.value,
+          text: (o.textContent ?? "").trim(),
+          disabled: o.disabled,
+        })),
       );
-      const valid =
-        options.find((o, i) => i > 0 && o.value.trim() !== "" && !o.disabled) ??
-        options.find((o) => o.value.trim() !== "" && !o.disabled);
-      if (valid) await sel.selectOption(valid.value).catch(() => {});
+      // 実選択肢: disabled でなく、テキストがプレースホルダでないもの。value は空のことも
+      // ある (例: htm の 従業員数 は全 option が value="") ので value 空は許容し、index で選ぶ。
+      const isReal = (o: { index: number; value: string; text: string; disabled: boolean }) =>
+        !o.disabled && o.text !== "" && !PLACEHOLDER_RE.test(o.text);
+      const valid = options.find((o) => o.index > 0 && isReal(o)) ?? options.find(isReal);
+      if (valid) {
+        const sel2 = valid.value.trim() !== "" ? { value: valid.value } : { index: valid.index };
+        await sel.selectOption(sel2).catch(() => {});
+      }
     } catch {
       /* ignore */
     }
@@ -2135,16 +2298,22 @@ async function runSubmit(
     // キャプチャ検出 → バックグラウンドで解決開始 (フォーム充填と並行して待機)
     stageRef.s = "項目入力";
     let captchaHandle: CaptchaSolveHandle | null = null;
-    try {
-      captchaHandle = await startCaptchaSolve(page);
-    } catch {
-      /* キャプチャ検出に失敗しても処理を続行 */
+    // Method A (forceV3Token) 実行中は init script の乗っ取りトークンが正解なので、ここで
+    // 再度 ProxyLess で解いて inject すると高スコアトークンを上書きしてしまう。スキップする。
+    if (!options?.forceV3Token) {
+      try {
+        captchaHandle = await startCaptchaSolve(page);
+      } catch {
+        /* キャプチャ検出に失敗しても処理を続行 */
+      }
     }
     // ソルバの可否に関わらず DOM 上の CAPTCHA 有無を記録 (タイムアウト再分類に使用)。
     captchaRef.v = captchaRef.v || captchaHandle !== null || (await hasCaptchaOnPage(page));
 
     // 1) tel × 3 / zip × 2 のような分割入力欄を先に埋める (ユーザ要件)
     let consumedNames = await fillSplitGroups(form, input);
+    // 1b) 個別ラベルの無い「姓/名」2欄 (例: shiseido) を位置で振り分けて先に埋める
+    for (const n of await fillPositionalNameGroups(page, form, input)) consumedNames.add(n);
 
     // 2) 通常のテキスト/textarea/email/tel フィールドを埋める
     let filled = await fillTextLikeFields(page, form, input, consumedNames);
@@ -2160,6 +2329,7 @@ async function runSubmit(
       if (reForm) {
         form = reForm;
         consumedNames = await fillSplitGroups(form, input);
+        for (const n of await fillPositionalNameGroups(page, form, input)) consumedNames.add(n);
         filled = await fillTextLikeFields(page, form, input, consumedNames);
       }
     }
@@ -2293,7 +2463,8 @@ async function solveV3ForcedToken(formUrl: string, useProxy: boolean): Promise<s
   try {
     await gotoWithRetry(page, formUrl);
     await waitForFormRender(page);
-    const handle = await startCaptchaSolve(page);
+    // v3 はスコア型。住宅プロキシ経由で解いて高スコアトークンを得る (datacenter IP の低スコア対策)。
+    const handle = await startCaptchaSolve(page, { useResidentialProxy: true });
     // reCAPTCHA v3 (invisible/スコア型) のみ Method A の対象。v2/Turnstile は通常注入で対応。
     if (!handle || handle.info.type !== "recaptcha-v3") return null;
     const token = await Promise.race([
@@ -2579,10 +2750,13 @@ async function runSubmitAI(
     // キャプチャはバックグラウンドで解決開始
     stageRef.s = "AI: フォーム解析";
     let captchaHandle: CaptchaSolveHandle | null = null;
-    try {
-      captchaHandle = await startCaptchaSolve(page);
-    } catch {
-      /* 続行 */
+    // Method A (forceV3Token) 中は乗っ取りトークンを上書きしないよう再解決をスキップ。
+    if (!options?.forceV3Token) {
+      try {
+        captchaHandle = await startCaptchaSolve(page);
+      } catch {
+        /* 続行 */
+      }
     }
     captchaRef.v = captchaRef.v || captchaHandle !== null || (await hasCaptchaOnPage(page));
 

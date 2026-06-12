@@ -10,8 +10,29 @@ type Provider = {
   baseUrl: string;
   clientKey: string;
   // CAPTCHA 種別ごとに createTask 用の task オブジェクトを組み立てる (型名がベンダ差異)。
-  task: (websiteURL: string, info: CaptchaInfo) => Record<string, unknown>;
+  // proxy 指定時は ProxyLess ではなく住宅プロキシ経由で解き、v3 スコアを底上げする。
+  task: (websiteURL: string, info: CaptchaInfo, proxy?: string | null) => Record<string, unknown>;
 };
+
+// 住宅プロキシ (CapSolver の proxy フィールド用) を env から組み立てる。
+// PROXY_SERVER="http://host:port" + PROXY_USERNAME/PROXY_PASSWORD → "scheme://user:pass@host:port"。
+export function capsolverProxyFromEnv(): string | null {
+  const server = process.env["PROXY_SERVER"];
+  if (!server) return null;
+  const user = process.env["PROXY_USERNAME"] ?? "";
+  const pass = process.env["PROXY_PASSWORD"] ?? "";
+  try {
+    const u = new URL(server);
+    const scheme = (u.protocol || "http:").replace(":", "");
+    const hostport = u.host; // host:port
+    if (!hostport) return null;
+    return user && pass
+      ? `${scheme}://${encodeURIComponent(user)}:${encodeURIComponent(pass)}@${hostport}`
+      : `${scheme}://${hostport}`;
+  } catch {
+    return null;
+  }
+}
 
 function selectProvider(): Provider | null {
   const capsolver = process.env["CAPSOLVER_API_KEY"];
@@ -21,25 +42,31 @@ function selectProvider(): Provider | null {
       name: "capsolver",
       baseUrl: "https://api.capsolver.com",
       clientKey: capsolver,
-      task: (websiteURL, info) => {
+      task: (websiteURL, info, proxy) => {
+        // proxy 指定時は住宅プロキシ経由 (非ProxyLess) で解き、v3 スコアを底上げする。
+        const px = proxy ? { proxy } : {};
+        const pl = proxy ? "" : "ProxyLess";
         if (info.type === "recaptcha-v2")
           return {
-            type: info.isEnterprise
-              ? "ReCaptchaV2EnterpriseTaskProxyLess"
-              : "ReCaptchaV2TaskProxyLess",
+            type: info.isEnterprise ? `ReCaptchaV2EnterpriseTask${pl}` : `ReCaptchaV2Task${pl}`,
             websiteURL,
             websiteKey: info.siteKey,
+            ...px,
           };
         if (info.type === "recaptcha-v3")
           return {
-            type: info.isEnterprise
-              ? "ReCaptchaV3EnterpriseTaskProxyLess"
-              : "ReCaptchaV3TaskProxyLess",
+            type: info.isEnterprise ? `ReCaptchaV3EnterpriseTask${pl}` : `ReCaptchaV3Task${pl}`,
             websiteURL,
             websiteKey: info.siteKey,
             pageAction: info.pageAction ?? "submit",
+            ...px,
           };
-        return { type: "AntiTurnstileTaskProxyLess", websiteURL, websiteKey: info.siteKey };
+        return {
+          type: proxy ? "AntiTurnstileTask" : "AntiTurnstileTaskProxyLess",
+          websiteURL,
+          websiteKey: info.siteKey,
+          ...px,
+        };
       },
     };
   }
@@ -258,10 +285,16 @@ export async function detectCaptcha(page: Page): Promise<CaptchaInfo | null> {
   });
 }
 
-async function solve(websiteURL: string, info: CaptchaInfo): Promise<string> {
+async function solve(
+  websiteURL: string,
+  info: CaptchaInfo,
+  proxy?: string | null,
+): Promise<string> {
   const provider = selectProvider();
   if (!provider) throw new Error("no captcha provider configured");
-  const taskId = await createTask(provider, provider.task(websiteURL, info));
+  // proxy は capsolver のみ対応 (2captcha は別フィールド体系のため未対応 → ProxyLess)。
+  const px = provider.name === "capsolver" ? proxy : null;
+  const taskId = await createTask(provider, provider.task(websiteURL, info, px));
   return await pollTaskResult(provider, taskId);
 }
 
@@ -360,19 +393,23 @@ export type CaptchaSolveHandle = {
  *   - no captcha provider key (CAPSOLVER_API_KEY / TWOCAPTCHA_API_KEY) is set
  *   - no captcha is detected on the page
  */
-export async function startCaptchaSolve(page: Page): Promise<CaptchaSolveHandle | null> {
+export async function startCaptchaSolve(
+  page: Page,
+  opts?: { useResidentialProxy?: boolean },
+): Promise<CaptchaSolveHandle | null> {
   const provider = selectProvider();
   if (!provider) return null;
 
   const info = await detectCaptcha(page);
   if (!info) return null;
 
+  const proxy = opts?.useResidentialProxy ? capsolverProxyFromEnv() : null;
   console.info(
-    `[captcha-solver] detected ${info.type}${info.isEnterprise ? " (enterprise)" : ""} on ${page.url()} — solving via ${provider.name}`,
+    `[captcha-solver] detected ${info.type}${info.isEnterprise ? " (enterprise)" : ""} on ${page.url()} — solving via ${provider.name}${proxy ? " (residential proxy)" : ""}`,
   );
 
   const websiteURL = page.url();
-  const tokenPromise = solve(websiteURL, info).catch((err: unknown) => {
+  const tokenPromise = solve(websiteURL, info, proxy).catch((err: unknown) => {
     console.warn("[captcha-solver] solve failed:", (err as Error).message ?? err);
     return "";
   });
