@@ -407,21 +407,33 @@ async function getElementMeta(_page: Page, el: ElementHandle<Element>) {
         if (w?.textContent) labelText = w.textContent;
       }
       if (!labelText) {
-        // name/id/label[for] を持たない行ベースのフォーム (kintone 等) 対策。
+        // name/id/label[for] を持たない行ベースのフォーム (kintone / table) 対策。
         // 「入力欄が1つだけの行コンテナ」を祖先に探し、その中のラベル要素を採用する。
-        // 注: evaluate の引数名 (node) と衝突しないよう別名 (anc) を使う。
+        // 優先度: <th> (テーブル見出し) → label/dt/class系 → span/p。各候補から「必須/任意/※」
+        // 等のバッジ語を除いた実ラベルを採用する。注: 名前付き内部関数は使わない (__name回避)。
         let anc: Element | null = e.parentElement;
         for (let hop = 0; anc && hop < 6 && !labelText; hop++) {
           const inputCount = anc.querySelectorAll(
             "input:not([type=hidden]), select, textarea",
           ).length;
           if (inputCount <= 1) {
-            const lab = anc.querySelector(
-              'label, [class*="label"], [class*="title"], [class*="ttl"], [class*="head"], dt, th',
+            const cands: Element[] = [];
+            const th = anc.querySelector("th");
+            if (th) cands.push(th);
+            const lb = anc.querySelector(
+              'label, dt, [class*="label"], [class*="title"], [class*="ttl"], [class*="head"]',
             );
-            if (lab && !lab.querySelector("input, select, textarea")) {
-              const t = (lab.textContent || "").replace(/[\s　]+/g, " ").trim();
-              if (t && t.length <= 40) labelText = t;
+            if (lb) cands.push(lb);
+            for (const sp of Array.from(anc.querySelectorAll("span, p"))) cands.push(sp);
+            for (const lab of cands) {
+              if (lab.querySelector("input, select, textarea")) continue;
+              const raw = (lab.textContent || "").replace(/[\s　]+/g, " ").trim();
+              // 「必須/任意/※/*」等のバッジだけのテキストは実ラベルではないのでスキップ
+              const stripped = raw.replace(/[*＊※]|必須|任意|required|optional/gi, "").trim();
+              if (stripped.length >= 1 && stripped.length <= 40) {
+                labelText = stripped;
+                break;
+              }
             }
           }
           anc = anc.parentElement;
@@ -1069,34 +1081,45 @@ async function applyChoiceDefaults(
     if (!anyChecked && list[0]) await checkOrClickLabel(list[0], page);
   }
 
-  // ---- checkbox: 同意/必須を必ずチェック + 最低1つ保証 ----
+  // ---- checkbox ----
   const checkboxes = await form.$$('input[type="checkbox"]');
   if (checkboxes.length === 0) return;
-  let anyChecked = false;
+  // (1) 同意/必須系は必ずチェック
   for (const cb of checkboxes) {
     try {
-      if (await (cb as ElementHandle<HTMLInputElement>).isChecked()) {
-        anyChecked = true;
-        continue;
-      }
+      if (await (cb as ElementHandle<HTMLInputElement>).isChecked()) continue;
       const id = (await cb.getAttribute("id")) ?? "";
       const nameAttr = ((await cb.getAttribute("name")) ?? "").toLowerCase();
       const required = await cb.evaluate((n) => (n as HTMLInputElement).required).catch(() => false);
       const labelText = await readCheckboxLabel(cb, page, id);
-      const isConsent =
+      if (
         required ||
         CONSENT_RE.test(`${nameAttr}|${id.toLowerCase()}`) ||
-        CONSENT_RE.test(labelText);
-      if (isConsent) {
+        CONSENT_RE.test(labelText)
+      ) {
         await checkOrClickLabel(cb, page);
-        anyChecked = true;
       }
     } catch {
       /* ignore */
     }
   }
-  // どの checkbox もチェックされていなければ先頭をチェック (単独必須同意ボックス対策)
-  if (!anyChecked && checkboxes[0]) await checkOrClickLabel(checkboxes[0], page);
+  // (2) name グループごとに最低1つチェックを保証する (ユーザー要件: 各チェックボックス欄で
+  //     少なくとも1つ有効化。必須チェック欄の未選択による送信失敗を防ぐ)。name 無しの
+  //     単独チェックボックスはそれぞれ独立グループ扱い。
+  const cbGroups = new Map<string, ElementHandle<Element>[]>();
+  for (const cb of checkboxes) {
+    const name = ((await cb.getAttribute("name")) ?? "").toLowerCase();
+    const key = name || `__cb_${cbGroups.size}`;
+    const list = cbGroups.get(key) ?? [];
+    list.push(cb);
+    cbGroups.set(key, list);
+  }
+  for (const list of cbGroups.values()) {
+    const anyChecked = await Promise.all(
+      list.map((cb) => (cb as ElementHandle<HTMLInputElement>).isChecked().catch(() => false)),
+    ).then((arr) => arr.some(Boolean));
+    if (!anyChecked && list[0]) await checkOrClickLabel(list[0], page);
+  }
 }
 
 // ============= Text-like field filling (input + textarea) =============
