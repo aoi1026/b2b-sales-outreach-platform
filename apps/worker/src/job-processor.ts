@@ -16,7 +16,7 @@ const prisma = new PrismaClient();
 const INTER_COMPANY_DELAY_MS = 2000;
 const MAX_ATTEMPTS = 4;
 // 1社あたりの全リトライ含む最大処理時間。これを超えると TIMEOUT 扱いで次社へ。
-const PER_COMPANY_TIMEOUT_MS = 180_000;
+const PER_COMPANY_TIMEOUT_MS = 240_000;
 // レシピがこの回数連続的に失敗したら無効化し、次回は Claude で作り直す。
 const RECIPE_FAIL_DISABLE_THRESHOLD = 3;
 
@@ -353,11 +353,21 @@ export async function processDeliveryJob(
             errorMessage: (e as Error).message,
           };
         }
-        // バリデーション失敗なら、次回は全角化した入力で再試行 (一度だけ)。
+        // TIMEOUT (重い/遅いページ) の同一入力での即時リトライは、同じ流れを再実行して
+        // 残り時間を浪費するだけで成功率に寄与しないため打ち切る。残時間は AI 再送に回す。
+        if (last.errorType === "TIMEOUT") break;
+        // フォーム/項目を特定できない構造的失敗 (一致タグが無い等) はヒューリスティックの
+        // 再試行では解消しないため即打ち切り、Claude AI 解析に回す (ユーザ要件)。
+        if (last.errorType === "FORM_NOT_FOUND" || last.errorType === "FIELD_MISMATCH") break;
+        // バリデーション失敗は「全角必須欄への半角混入」対策として全角化で一度だけ再試行。
         if (last.errorType === "VALIDATION_ERROR" && !fullWidthTried && i + 1 < maxAttempts) {
           current = toFullWidthInput(current);
           fullWidthTried = true;
+          continue;
         }
+        // 上記以外 (UNKNOWN/SUBMIT_FAILED、全角再試行後の再失敗等) は同一入力の再試行が
+        // 無益なので打ち切り、残時間をフォールバック/AI 解析に充てる (AI を積極利用)。
+        break;
       }
       return { attempts, result: last };
     };

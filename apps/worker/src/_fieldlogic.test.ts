@@ -120,5 +120,55 @@ console.log("\n=== カタカナ 姓/名 分割 (セイ/メイ) ===");
   eq("mei(カナ) value", r.value, "ヒデヒコ");
 }
 
+console.log("\n=== asagami.co.jp (name が日本語ラベルそのもの) ===");
+{
+  const r = roleVal(meta({ name: "姓" }));
+  eq("name=姓 role", r.role, "person_last");
+  eq("name=姓 value", r.value, "白石");
+}
+{
+  const r = roleVal(meta({ name: "名" }));
+  eq("name=名 role", r.role, "person_first");
+  eq("name=名 value", r.value, "秀彦");
+}
+{
+  const r = roleVal(meta({ name: "セイ" }));
+  eq("name=セイ role", r.role, "person_kana_last");
+  eq("name=セイ value", r.value, "シライシ");
+}
+{
+  const r = roleVal(meta({ name: "メイ" }));
+  eq("name=メイ role", r.role, "person_kana_first");
+  eq("name=メイ value", r.value, "ヒデヒコ");
+}
+// 会社名(会社名) を誤って person_first にしないこと (名 のトークン誤一致回避の確認)
+eq("name=会社名 not person_first", detectFieldRole(meta({ name: "会社名" })) === "person_first", false);
+
+console.log("\n=== reg26.smp.ne.jp (name/class/value に手掛かりなし・ラベルのみ) ===");
+{
+  // name はシステム生成、姓名はラベル(隣接テキスト)だけにある
+  const r = roleVal(meta({ name: "item_001", labelText: "姓" }));
+  eq("label=姓 role", r.role, "person_last");
+  eq("label=姓 value", r.value, "白石");
+}
+{
+  const r = roleVal(meta({ name: "item_002", labelText: "名" }));
+  eq("label=名 role", r.role, "person_first");
+  eq("label=名 value", r.value, "秀彦");
+}
+{
+  const r = roleVal(meta({ name: "item_003", labelText: "セイ" }));
+  eq("label=セイ role", r.role, "person_kana_last");
+  eq("label=セイ value", r.value, "シライシ");
+}
+{
+  const r = roleVal(meta({ name: "item_004", labelText: "メイ" }));
+  eq("label=メイ role", r.role, "person_kana_first");
+  eq("label=メイ value", r.value, "ヒデヒコ");
+}
+// ラベル「会社名」「お名前」「氏名」を 名(person_first) と誤検出しないこと
+eq("label=会社名 not person_first", detectFieldRole(meta({ name: "x1", labelText: "会社名" })) === "person_first", false);
+eq("label=お名前 not person_first", detectFieldRole(meta({ name: "x2", labelText: "お名前" })) === "person_first", false);
+
 console.log(`\n${fail === 0 ? "🎉 ALL PASS" : "💥 FAILURES"}: ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);
