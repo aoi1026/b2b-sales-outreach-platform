@@ -1602,6 +1602,16 @@ async function clickConfirmationChain(
     const btn = await waitForConfirmationButton(page, 6_000);
     if (!btn) break;
 
+    // ユーザー要件: 確認/次画面に再び CAPTCHA が出ている場合は、解決の時間を確保して
+    // トークンを注入してから次の送信ボタンを押す。CAPTCHA が無ければ startCaptchaSolve は
+    // null を返すので何もしない。
+    try {
+      const h = await startCaptchaSolve(page);
+      if (h) await injectCaptchaToken(page, h);
+    } catch {
+      /* CAPTCHA 解決失敗は無視して押下を試みる */
+    }
+
     await clickWithFallback(btn, page);
     lastClickAt = Date.now();
     await waitForFormResponse(page);
