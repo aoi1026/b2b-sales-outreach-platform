@@ -1631,14 +1631,18 @@ async function clickWithFallback(
 }
 
 // 送信系ボタンとして許容するテキスト/value のパターン (お問い合わせ系含む)
-const SUBMIT_TEXT_RE = /送\s*信|確\s*認|submit|send|確\s*定|問い?\s*合わ?\s*せる?|入力\s*内容\s*の?\s*確認|お?問い?合わ?せ\s*内容\s*の?\s*確認|next|次へ|登録|申し?込/i;
+const SUBMIT_TEXT_RE = /送\s*信|確\s*認|submit|send|確\s*定|問い?\s*合わ?\s*せる?|入力\s*内容\s*の?\s*確認|お?問い?合わ?せ\s*内容\s*の?\s*確認|next|次へ|登録|申し?込|同意(?:して|する|の上)|承諾(?:する|して)/i;
 
-// 「戻る」「キャンセル」「リセット」など、押してはいけないボタンのテキスト/値
-const NEGATIVE_BUTTON_RE = /戻る|キャンセル|リセット|クリア|削除|cancel|reset|clear|back|close|閉じる/i;
+// 「戻る」「キャンセル」「リセット」など、押してはいけないボタンのテキスト/値。
+// 「同意しない / 同意できません / 拒否」など同意系の否定ボタンも除外する (bb-f 等の
+// 「同意する / 同意しない」2択で誤って否定側を押さないため)。
+const NEGATIVE_BUTTON_RE =
+  /戻る|キャンセル|リセット|クリア|削除|cancel|reset|clear|back|close|閉じる|同意し(?:ない|ません)|同意でき(?:ない|ません)|承諾し(?:ない|ません)|拒否|同意せず/i;
 // 確認画面の「最終送信」ボタンのラベル。「送信」以外に「登録 / 申込 / 確定 / この内容で」等も
-// 拾う (例: tptc.co.jp の確認画面は最終ボタンが「登録」)。否定語は呼び出し側で除外する。
+// 拾う (例: tptc.co.jp の確認画面は最終ボタンが「登録」)。また「同意して進む / 同意する」など
+// 同意して次へ進む形式 (例: bb-f) も拾う。否定語は呼び出し側で除外する。
 const CONFIRM_SUBMIT_TEXT_RE =
-  /送\s*信|登\s*録|申\s*込|申し込|確\s*定|この内容で|内容を送信|(?:上記|下記|以下)(?:の内容)?で(?:送信|登録|よろし)|送信する|Send|Submit/i;
+  /送\s*信|登\s*録|申\s*込|申し込|確\s*定|この内容で|内容を送信|(?:上記|下記|以下)(?:の内容)?で(?:送信|登録|よろし)|送信する|同意(?:して|する|の上)|承諾(?:する|して)|Send|Submit/i;
 
 async function findSubmitButtonIn(scope: Searchable): Promise<ElementHandle<Element> | null> {
   // 1. type="submit" の input/button (value/text が「戻る」等でないことを確認)
@@ -2099,6 +2103,49 @@ async function waitForFormResponse(page: Page): Promise<void> {
   ]);
 }
 
+// 多段確認フォーム (入力→確認→完了) で完了画面の表示が遅いサイト向けに、完了/エラーの
+// 「確定シグナル」が出るまで timeoutMs まで余裕をもってポーリング待機する。
+//   - 確定成功 (確認画面でない & 成功文言/完了URL) → 即終了
+//   - 明確なエラー (バリデーション/送信失敗文言)   → 即終了
+//   - いずれも出なければ timeout まで待ってから抜ける
+// さらに、まだ「確認画面」に留まっている場合 (= 最終送信が未完了) は、最終送信ボタンを
+// 最大2回まで押し直して完了を促す。確認画面は送信完了前の段階なので、ここで押しても
+// 二重送信にはならない (完了画面・成功検出後は決して押さない)。
+// これにより「送信は完了したが完了画面を確認できない=暫定成功(不明)」を確定成功へ引き上げる。
+async function waitForCompletionSignal(page: Page, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let extraPresses = 0;
+  for (;;) {
+    const content = await page.content().catch(() => "");
+    if (isErrorContent(content)) return;
+    const onConfirm = await onConfirmPage(page);
+    if (
+      !onConfirm &&
+      (isStrongSuccess(content) || isSuccessContent(content) || looksLikeSuccessUrl(page.url()))
+    )
+      return;
+    if (Date.now() >= deadline) return;
+    // 確認画面に留まっている = 未送信。表示遅延・押下取りこぼし対策として最終送信ボタンを
+    // 押し直す (最大2回)。onConfirm が true の間だけなので二重送信は起きない。
+    if (onConfirm && extraPresses < 2) {
+      const btn = await waitForConfirmationButton(page, 2_500);
+      if (btn) {
+        try {
+          const h = await startCaptchaSolve(page);
+          if (h) await injectCaptchaToken(page, h, 60_000);
+        } catch {
+          /* CAPTCHA 解決失敗は無視 */
+        }
+        await clickWithFallback(btn, page);
+        extraPresses++;
+        await waitForFormResponse(page);
+        continue;
+      }
+    }
+    await page.waitForTimeout(700);
+  }
+}
+
 // 送信後にバリデーションで弾かれた疑いのフィールドを列挙してログ出力。
 // (記事の Fix #7 — 何がダメだったかを可視化する)
 async function logInvalidFields(page: Page): Promise<void> {
@@ -2458,6 +2505,10 @@ async function runSubmit(
     // ユーザ要件: 最終送信ボタン押下から「1秒後」にスクリーンショットを撮り始める。
     const sinceLastClick = Date.now() - submittedAt;
     if (sinceLastClick < 1000) await page.waitForTimeout(1000 - sinceLastClick);
+    // 多段確認フォーム (bbtower / bb-f 等: 入力→確認→完了) は完了画面の表示が遅く、
+    // 1秒では完了文言が出ず「暫定成功(不明)」になりやすい。完了/エラーの確定シグナルが
+    // 出るまで最大15秒待ってから判定・撮影する (確定すれば早期に抜ける)。
+    await waitForCompletionSignal(page, 15_000);
     const shot = await takeShot(page, options);
 
     const urlAfter = page.url();
@@ -2911,6 +2962,8 @@ async function runSubmitAI(
 
     const since = Date.now() - submittedAt;
     if (since < 1000) await page.waitForTimeout(1000 - since);
+    // 多段確認フォームの完了画面表示が遅いケースに備え、確定シグナルが出るまで余裕をもって待つ。
+    await waitForCompletionSignal(page, 15_000);
     const shot = await takeShot(page, options);
 
     const urlAfter = page.url();
