@@ -23,7 +23,8 @@ async function recoverOrphanedJobs(boss: PgBoss): Promise<void> {
       await boss.send(
         QUEUE_DELIVERY,
         { jobId: j.id },
-        { expireInHours: 4, retryLimit: 0 },
+        // enqueueDeliveryJob と揃える (pg-boss 上限の 24 時間。3社並列で5000社≒19時間)
+        { expireInHours: 23, retryLimit: 0 },
       );
       console.log(`[worker] re-enqueued orphaned RUNNING job ${j.id}`);
     }

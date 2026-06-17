@@ -13,8 +13,9 @@ export async function getBoss(): Promise<PgBoss> {
     schema: "pgboss",
     // pg-boss 側の自動リトライは無効化。各社の3回リトライは worker 内で行う
     retryLimit: 0,
-    // ジョブ期限切れによる二重起動を防ぐためデフォルトを延長
-    expireInHours: 4,
+    // ジョブ期限切れによる二重起動を防ぐためデフォルトを延長。pg-boss の上限は 24 時間
+    // 未満なので 23 時間にする。3社並列なら最大 5000 社でも約19時間で収まる。
+    expireInHours: 23,
     // Supabase Free tier の session pool (15) を圧迫しないため最小化
     max: 2,
     // pg-boss のメンテナンス系を控えめに (接続消費を抑える)

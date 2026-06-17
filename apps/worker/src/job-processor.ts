@@ -34,6 +34,48 @@ function domainOf(url: string): string | null {
   }
 }
 
+// 送信前の URL 生存チェック (#3: リストのデータ品質対策)。リスト由来の誤 URL
+// (404/410・存在しないドメイン) をブラウザ起動前に切り分け、時間・プロキシ・CAPTCHA
+// 予算の浪費を防ぐ。偽陰性 (正常フォームを誤って弾く) を避けるため、確実に死んでいる
+// 場合のみ理由文字列を返し、それ以外 (403/5xx/タイムアウト/HEAD非対応等) は null=通常送信に進む
+// (ボット遮断などは Playwright なら通過できるケースがあるため)。
+async function precheckUrlDead(url: string): Promise<string | null> {
+  const target = url.trim();
+  // URL として不正なものは生存チェック以前の問題として弾く。
+  try {
+    new URL(target);
+  } catch {
+    return "フォーム URL の形式が不正です。リストの URL をご確認ください。";
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8_000);
+  try {
+    const res = await fetch(target, {
+      method: "GET",
+      redirect: "follow",
+      signal: controller.signal,
+      headers: {
+        "user-agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+      },
+    });
+    if (res.status === 404 || res.status === 410) {
+      return `フォーム URL が無効です (HTTP ${res.status})。リストの URL をご確認ください。`;
+    }
+    return null;
+  } catch (e) {
+    const msg = (e as Error)?.message ?? "";
+    const cause = (e as { cause?: { code?: string } })?.cause?.code ?? "";
+    if (/ENOTFOUND|EAI_AGAIN/.test(`${msg} ${cause}`)) {
+      return "ドメインを解決できませんでした (URL のドメインが存在しない可能性があります)。リストの URL をご確認ください。";
+    }
+    return null; // タイムアウト/接続エラー等は不明扱いで通常送信に進む
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // 有効かつ失敗閾値未満の学習済みレシピを返す。無ければ null。
 async function loadRecipe(domain: string): Promise<FillPlan | null> {
   try {
@@ -214,26 +256,20 @@ export async function processDeliveryJob(
     return !existing || existing.status === "PENDING" || existing.status === "RUNNING";
   });
 
-  for (const company of pendingCompanies) {
-    const flags = await refreshJobFlags(jobId);
-    if (!flags) break;
-    if (flags.cancelRequested) {
-      await prisma.deliveryJob.update({
-        where: { id: jobId },
-        data: { status: "CANCELLED", completedAt: new Date() },
-      });
-      console.log(`[worker] job ${jobId} cancelled`);
-      return;
-    }
-    if (flags.pauseRequested) {
-      await prisma.deliveryJob.update({
-        where: { id: jobId },
-        data: { status: "PAUSED" },
-      });
-      console.log(`[worker] job ${jobId} paused`);
-      return;
-    }
+  // 1ジョブ内を WORKER_CONCURRENCY 社ずつ並列処理する (デフォルト3)。CPU は余裕がある一方
+  // メモリ (Chromium ページ 1 つあたり数百MB) が制約のため、安全側で 1〜10 にクランプする。
+  const CONCURRENCY = Math.max(1, Math.min(10, Number(process.env["WORKER_CONCURRENCY"] ?? 3)));
+  console.log(`[worker] job ${jobId} concurrency=${CONCURRENCY}, pending=${pendingCompanies.length}`);
 
+  // 共有カーソルと停止フラグ。Node は単一スレッドのため nextIndex++ / カウンタ加算は
+  // await をまたがない限りアトミックで、レース無しに共有できる。
+  let nextIndex = 0;
+  let stopReason: null | "cancel" | "pause" | "gone" = null;
+
+  // 1社分の処理 (BL判定→入力生成→送信→結果保存→社間ディレイ)。
+  const processOne = async (
+    company: (typeof pendingCompanies)[number],
+  ): Promise<void> => {
     // BL check
     let domain: string | null = null;
     try {
@@ -252,7 +288,7 @@ export async function processDeliveryJob(
           attemptedAt: new Date(),
         },
       });
-      continue;
+      return;
     }
 
     const st = job.senderTemplate;
@@ -403,6 +439,17 @@ export async function processDeliveryJob(
     // 本文(本命)→失敗かつ短文フォールバックありなら短文で再送→なお失敗なら
     // AI 解析で再送 (学習済みレシピがあれば再利用)、までを per-company 時間内で実行する。
     const runAll = async (): Promise<Outcome> => {
+      // #3: 送信前 URL 生存チェック。確実に死んでいる URL はブラウザを起動せず即時に
+      // 「送信不可」として切り分ける (リストのデータ品質問題を明確化し、予算を節約する)。
+      const deadReason = await precheckUrlDead(company.formUrl);
+      if (deadReason) {
+        console.warn(`[worker] precheck dead url for ${company.name}: ${deadReason}`);
+        return {
+          attempts: 0,
+          result: { status: "failed", errorType: "NETWORK_ERROR", errorMessage: deadReason },
+        };
+      }
+
       const main = await attemptLoop(input, MAX_ATTEMPTS, "attempt");
       if (main.result.status === "success") return main;
 
@@ -491,8 +538,13 @@ export async function processDeliveryJob(
     ]);
 
     // 安全網が発火した = ブラウザ生成やDB等で想定外ハングが起きた可能性が高い。
-    // 次の社に持ち越さないようブラウザを作り直す。
-    if (finalResult.errorType === "TIMEOUT" && finalResult.errorMessage?.includes("安全網")) {
+    // 次の社に持ち越さないようブラウザを作り直す。ただし並列実行中 (CONCURRENCY>1) は
+    // 共有ブラウザを閉じると他レーンの送信を巻き込んで壊すため、逐次実行時のみ再生成する。
+    if (
+      CONCURRENCY === 1 &&
+      finalResult.errorType === "TIMEOUT" &&
+      finalResult.errorMessage?.includes("安全網")
+    ) {
       console.warn(`[worker] safety timeout for ${company.name}; recycling browser`);
       await closeBrowser().catch(() => null);
     }
@@ -536,7 +588,54 @@ export async function processDeliveryJob(
     });
 
     await new Promise((r) => setTimeout(r, INTER_COMPANY_DELAY_MS));
+  };
+
+  // CONCURRENCY 本のレーンで共有カーソルから社を取り出して並列処理する。各レーンは
+  // 社を取り出す前に pause/cancel フラグを確認し、要求があれば全レーンを停止する。
+  // 送信中の社は中断せず完了させてから止める (フォーム途中送信を避けるため)。
+  const lane = async (): Promise<void> => {
+    for (;;) {
+      if (stopReason) return;
+      const flags = await refreshJobFlags(jobId);
+      if (!flags) {
+        stopReason = "gone";
+        return;
+      }
+      if (flags.cancelRequested) {
+        stopReason = "cancel";
+        return;
+      }
+      if (flags.pauseRequested) {
+        stopReason = "pause";
+        return;
+      }
+      const i = nextIndex++;
+      const company = pendingCompanies[i];
+      if (!company) return; // 全社取り切った
+      await processOne(company);
+    }
+  };
+
+  await Promise.all(Array.from({ length: CONCURRENCY }, () => lane()));
+
+  // 停止要求で抜けた場合は DONE にせず、要求に応じた終了状態にする。
+  if (stopReason === "cancel") {
+    await prisma.deliveryJob.update({
+      where: { id: jobId },
+      data: { status: "CANCELLED", completedAt: new Date() },
+    });
+    console.log(`[worker] job ${jobId} cancelled`);
+    return;
   }
+  if (stopReason === "pause") {
+    await prisma.deliveryJob.update({
+      where: { id: jobId },
+      data: { status: "PAUSED" },
+    });
+    console.log(`[worker] job ${jobId} paused`);
+    return;
+  }
+  if (stopReason === "gone") return;
 
   await prisma.deliveryJob.update({
     where: { id: jobId },

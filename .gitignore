@@ -64,3 +64,6 @@ apps/lp/.received-log.jsonl
 マイルストーン1_要件整理.xlsx
 マイルストーン1_最終要件定義書.md
 白石様_lancers offe_chatting listr.txt
+
+# SFTP config
+.ftpconfig

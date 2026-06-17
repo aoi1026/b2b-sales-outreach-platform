@@ -34,7 +34,7 @@ export default async function NewSendJobPage() {
       <h1 className="text-2xl font-bold mb-2">自動送信 新規ジョブ作成</h1>
       <p className="text-sm text-gray-600 mb-6">
         案件・リスト・テンプレートを選択して、送信ジョブを作成します。送信上限は 1 ジョブ
-        50 件です。
+        5,000 件です。
       </p>
 
       <NewJobClient

@@ -2011,6 +2011,44 @@ function looksLikeSuccessUrl(url: string): boolean {
   return /thank|thanks|complete|completed|success|received|finish|finished|done|sent|submitted|完了|お礼|kanryo|kanryou/i.test(url);
 }
 
+// 送信先「サイト側」のエラーページ (500/502/503・メンテナンス・汎用エラー画面) を判定する。
+// フォーム内の項目バリデーションエラーとは区別し、こちらは送信不可(サイト側)として扱う。
+// 誤検知を避けるため、汎用語「エラー」単独では拾わず、サーバーエラーに特有の強い組み合わせのみ。
+const SITE_ERROR_PATTERNS: RegExp[] = [
+  /internal server error/i,
+  /service (?:temporarily )?unavailable/i,
+  /\bbad gateway\b/i,
+  /\bgateway time-?out\b/i,
+  /\b50[0-9]\s*(?:error|internal|service)/i,
+  /ただいま(?:アクセスが集中|大変混み合|サーバ)/,
+  /メンテナンス(?:中|のため|を実施)/,
+  /(?:ただいま|現在).{0,12}(?:ご利用|アクセス).{0,8}できません/,
+  // 「エラーが発生しました … 時間をおいて/再度お試し」の汎用サーバーエラーページ (例: aiholdings)
+  /エラーが発生しました[\s\S]{0,120}(?:時間をおいて|しばらく(?:経って|たって)|再度(?:お試し|アクセス))/,
+];
+function isSiteErrorPage(content: string): boolean {
+  return SITE_ERROR_PATTERNS.some((p) => p.test(content));
+}
+
+// 本体フォームの手前に挟まる「入口ゲート」(販売店/代理店確認・年齢確認・医療従事者確認・
+// 地域選択など) を判定する。ここで停止した失敗は CAPTCHA ではなく「フォームに到達できず」
+// = フォームなし扱いにする。極めて特異な文言のみに限定して誤検知を防ぐ。
+const ENTRY_GATE_PATTERNS: RegExp[] = [
+  /あなたは販売店ですか/,
+  /(?:販売店|代理店|特約店)(?:様|さま)?(?:の方|ですか|向け|専用|限定)/,
+  /医療(?:関係者|従事者)(?:の方|向け|専用|限定|ですか)/,
+  /(?:あなたは|ご覧の方は|ご覧いただいている方は).{0,12}(?:医療|専門家|会員)/,
+  /年齢(?:確認|認証)/,
+  /20\s*歳(?:以上)?(?:です|ですか|の方)/,
+  /(?:お酒|アルコール).{0,12}20\s*歳/,
+  /お住まいの(?:国|地域)を(?:選択|お選び)/,
+];
+function isEntryGatePage(content: string): boolean {
+  // ゲート特有の文言 + 「進む/同意/はい/確認/enter」等の遷移操作が同居する場合のみ。
+  if (!ENTRY_GATE_PATTERNS.some((p) => p.test(content))) return false;
+  return /(?:確認|同意|はい|いいえ|進む|入る|次へ|enter|agree|yes\b)/i.test(content);
+}
+
 // 確認画面 (入力→確認→完了の「確認」段階) に居るか。確認画面に特有の
 // 「入力画面に戻る / 内容を修正」ボタンが可視テキストにあるかで判定する。完了画面や
 // 単発フォームの成功画面にはこの種の「入力に戻って修正する」導線が無いため、CF7 等の
@@ -2191,15 +2229,42 @@ function applyCaptchaClassification(
   result: SubmitResult,
   detected: boolean,
   tokenInjected: boolean,
+  content?: string,
 ): SubmitResult {
   void tokenInjected;
-  if (result.status !== "failed" || !detected) return result;
+  if (result.status !== "failed") return result;
+
+  // (誤分類の切り分け) CAPTCHA 再分類より前に、明確に CAPTCHA 以外と判る原因を振り分ける。
+  // ページ本文があれば、サイト側エラー / 入口ゲートを先に判定する (CAPTCHA 検出の有無に
+  // 関わらず適用する。ゲート画面にも reCAPTCHA が同居して CAPTCHA_FAILED に誤分類される
+  // ことがあるため)。
+  if (content) {
+    // 1) サイト側のエラーページ (500/メンテ/汎用エラー) → 送信不可(サイト側) = NETWORK_ERROR。
+    if (isSiteErrorPage(content)) {
+      result.errorType = "NETWORK_ERROR";
+      result.errorMessage =
+        "送信先サイトがエラー応答を返しました（サイト側の一時的な問題の可能性があります）。";
+      return result;
+    }
+    // 2) 販売店/年齢/地域確認などの入口ゲートで本体フォームに到達できていない → フォームなし。
+    if (isEntryGatePage(content)) {
+      result.errorType = "FORM_NOT_FOUND";
+      result.errorMessage =
+        "確認ページ（販売店・年齢・地域確認など）で本体の入力フォームに到達できませんでした。";
+      return result;
+    }
+  }
+
+  if (!detected) return result;
   // CAPTCHA があるページでの失敗は、VALIDATION_ERROR/UNKNOWN に加えて TIMEOUT も
   // 「送信不可」とみなす (例: kyowa-line は reCAPTCHA で完了画面に到達できず TIMEOUT)。
   const eligible = new Set(["VALIDATION_ERROR", "UNKNOWN", "TIMEOUT"]);
   if (!eligible.has(result.errorType ?? "")) return result;
   result.errorType = "CAPTCHA_FAILED";
-  result.errorMessage = "問い合わせ受付を許可しないフォームのため送信できませんでした。";
+  // 受付自体は許可されている (人手では送信できる) ことが多いため、実態に合わせて
+  // 「自動送信が認証で拒否された」旨を残す。手動送信での対応を促す文言にする。
+  result.errorMessage =
+    "reCAPTCHA等の認証で自動送信が拒否されました。手動送信での対応を推奨します。";
   return result;
 }
 
@@ -2235,12 +2300,14 @@ async function withDeadline(
         const shot = await takeShot(page, options).catch(() => undefined);
         // タイムアウト時点でも CAPTCHA の有無を確認し、あれば「送信不可」に再分類する。
         const captcha = captchaRef?.v || (await hasCaptchaOnPage(page));
+        // タイムアウト時点のページ本文も取得し、サイト側エラー/入口ゲートを切り分ける。
+        const content = await page.content().catch(() => "");
         let result: SubmitResult = {
           status: "failed",
           errorType: "TIMEOUT",
           errorMessage: `処理時間 ${Math.round(overallMs / 1000)} 秒を超過しました（段階: ${stageRef.s}）。`,
         };
-        result = applyCaptchaClassification(result, captcha, false);
+        result = applyCaptchaClassification(result, captcha, false, content);
         if (shot) result.screenshot = shot;
         resolve(result);
       })();
@@ -2268,7 +2335,9 @@ async function runSubmit(
   const captchaRef = { v: false };
   const core = async (): Promise<SubmitResult> => {
    try {
-    const response = await gotoWithRetry(page, formUrl);
+    // リスト由来の URL に紛れる前後の空白・改行を除去してから遷移する
+    // (末尾スペースで誤った URL に遷移し 404/エラーページになる事故を防ぐ)。
+    const response = await gotoWithRetry(page, formUrl.trim());
     const httpStatus = response?.status() ?? 0;
     if (httpStatus >= 400) {
       return await attachShot(page, options, {
@@ -2429,8 +2498,14 @@ async function runSubmit(
         httpStatus,
       };
     }
-    // CAPTCHA 検出ページの失敗は CAPTCHA_FAILED に再分類する
-    result = applyCaptchaClassification(result, captchaHandle !== null, captchaTokenInjected);
+    // CAPTCHA 検出ページの失敗は CAPTCHA_FAILED に再分類する (サイト側エラー/入口ゲートは
+    // content を見て CAPTCHA より優先で正しい原因に振り分ける)
+    result = applyCaptchaClassification(
+      result,
+      captchaHandle !== null,
+      captchaTokenInjected,
+      content,
+    );
     if (shot) result.screenshot = shot;
 
     // ユーザ要件: 最終送信ボタン押下からこのサイトに「7秒間」は留まってから次へ進む
@@ -2729,7 +2804,9 @@ async function runSubmitAI(
   const captchaRef = { v: false };
   const core = async (): Promise<SubmitResult> => {
    try {
-    const response = await gotoWithRetry(page, formUrl);
+    // リスト由来の URL に紛れる前後の空白・改行を除去してから遷移する
+    // (末尾スペースで誤った URL に遷移し 404/エラーページになる事故を防ぐ)。
+    const response = await gotoWithRetry(page, formUrl.trim());
     const httpStatus = response?.status() ?? 0;
     if (httpStatus >= 400) {
       return await attachShot(page, options, {
@@ -2870,8 +2947,14 @@ async function runSubmitAI(
         httpStatus,
       };
     }
-    // CAPTCHA 検出ページの失敗は CAPTCHA_FAILED に再分類する
-    result = applyCaptchaClassification(result, captchaHandle !== null, captchaTokenInjected);
+    // CAPTCHA 検出ページの失敗は CAPTCHA_FAILED に再分類する (サイト側エラー/入口ゲートは
+    // content を見て CAPTCHA より優先で正しい原因に振り分ける)
+    result = applyCaptchaClassification(
+      result,
+      captchaHandle !== null,
+      captchaTokenInjected,
+      content,
+    );
     if (shot) result.screenshot = shot;
     // 学習用: 実行したプランを結果に添付 (成功時に job-processor がレシピ保存する)
     result.recipe = usedPlan;
