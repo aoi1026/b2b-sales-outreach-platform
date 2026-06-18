@@ -8,9 +8,8 @@
   ],
   "scripts": {
     "dev:admin": "npm run dev --workspace=@mvp/admin",
-    "dev:lp": "npm run dev --workspace=@mvp/lp",
     "dev:worker": "npm run dev --workspace=@mvp/worker",
-    "dev": "concurrently -n admin,lp,worker -c blue,green,magenta \"npm:dev:admin\" \"npm:dev:lp\" \"npm:dev:worker\"",
+    "dev": "concurrently -n admin,worker -c blue,magenta \"npm:dev:admin\" \"npm:dev:worker\"",
     "build": "npm run db:generate && npm run build --workspace=@mvp/admin",
     "db:generate": "npm run generate --workspace=@mvp/db",
     "db:migrate": "npm run migrate --workspace=@mvp/db",
@@ -19,9 +18,8 @@
     "db:studio": "npm run studio --workspace=@mvp/db",
     "db:seed": "npm run seed --workspace=@mvp/db",
     "start:admin": "npm run start --workspace=@mvp/admin",
-    "start:lp": "npm run start --workspace=@mvp/lp",
     "start:worker": "npm run start --workspace=@mvp/worker",
-    "start": "concurrently -n admin,lp,worker -c blue,green,magenta \"npm:start:admin\" \"npm:start:lp\" \"npm:start:worker\""
+    "start": "concurrently -n admin,worker -c blue,magenta \"npm:start:admin\" \"npm:start:worker\""
   },
   "devDependencies": {
     "concurrently": "^9.2.1",

@@ -40,7 +40,7 @@
 | 自動送信 | 一時停止/中止 | 実行中ジョブの一時停止・中止リクエストに対応 |
 | 自動送信 | フォールバック | 初回送信が失敗した社に、短文フォールバックテンプレートで再送 |
 | 学習レシピ | AI 学習 | AI 送信が成功したフォーム入力プランをドメイン単位で保存・再利用（成功/失敗で強化・淘汰） |
-| 効果測定 | URL クリック計測 | 送信文中の URL をトラッキング URL へ置換し、クリックを記録 |
+| 効果測定 | URL クリック計測 | 送信文中の URL をトラッキング URL へ置換し、クリックを記録（リダイレクト用エンドポイントは別途用意が必要） |
 | ログ | 配信結果 | 社単位の成功/失敗/スキップ・エラー種別・スクリーンショット・手動送信フラグを記録、CSV エクスポート |
 | 認証 | ログイン | bcrypt + JWT（jose）によるセッション Cookie 認証 |
 
@@ -56,7 +56,6 @@ flowchart LR
 
     subgraph Apps["アプリケーション（モノレポ）"]
         ADMIN["admin (:3002)<br/>管理画面 / Next.js"]
-        LP["lp (:3001)<br/>LP・ダミーフォーム・クリック計測"]
         WORKER["worker<br/>送信ワーカー / Playwright"]
     end
 
@@ -81,13 +80,10 @@ flowchart LR
     WORKER -.経由.-> PROXY
     WORKER -.突破.-> CAPTCHA
     WORKER -.解析.-> AI
-    FORMS -. クリック .-> LP
-    LP --> DB
 ```
 
 - **admin**：オペレータが操作する管理画面。案件・リスト・テンプレート・送信ジョブを管理し、`pg-boss` 経由で worker にジョブを投入します。
 - **worker**：常駐プロセス。キューからジョブを受け取り、Playwright で実ブラウザを操作してフォーム送信を実行します。HTTP ポートは持ちません。
-- **lp**：サービス紹介 LP、送信動作確認用のダミーフォーム、そして URL クリック計測用のリダイレクト（`/r/[id]`）を提供します。
 - **PostgreSQL**：全データの永続化先。`pg-boss` のジョブキューも同一 DB 上に構築されます。
 
 ---
@@ -117,7 +113,6 @@ flowchart LR
 .
 ├── apps/
 │   ├── admin/        管理画面（Next.js, :3002）
-│   ├── lp/           LP・ダミーフォーム・クリック計測（Next.js, :3001）
 │   └── worker/       送信ワーカー（Playwright + pg-boss, 常駐）
 ├── packages/
 │   └── db/           Prisma スキーマ・生成クライアント・シード（@mvp/db）
@@ -265,7 +260,7 @@ npx playwright install --with-deps chromium
 | `PROXY_USERNAME` / `PROXY_PASSWORD` |  | プロキシ認証情報（国指定等） |
 | `TWOCAPTCHA_API_KEY` |  | 2captcha の API キー。未設定なら CAPTCHA 突破をスキップ |
 | `ANTHROPIC_API_KEY` |  | Claude の API キー。未設定なら AI 再送をスキップ |
-| `TRACK_BASE_URL` |  | URL クリック計測リダイレクト（lp の `/r/[id]`）の公開ベース URL |
+| `TRACK_BASE_URL` |  | URL クリック計測リダイレクト（`/r/[id]`）の公開ベース URL。計測を使う場合は別途リダイレクト用エンドポイントを用意 |
 
 > `DATABASE_URL` が pgbouncer（トランザクションプーラ, port 6543）を指す場合、`prisma migrate` は advisory lock を取得できないため、`DIRECT_URL` にセッションプーラ（port 5432, pgbouncer なし）を指定してください。
 
@@ -279,17 +274,15 @@ npx playwright install --with-deps chromium
 npm run dev
 ```
 
-`admin` / `lp` / `worker` が同時に起動し、ターミナルに色分けログが表示されます。
+`admin` / `worker` が同時に起動し、ターミナルに色分けログが表示されます。
 
 - **admin** … <http://localhost:3002>（管理画面）
-- **lp** … <http://localhost:3001>（LP・ダミーフォーム・クリック計測）
 - **worker** … 常駐プロセス（HTTP ポートなし。pg-boss 経由でジョブを受信）
 
 ### 個別起動
 
 ```bash
 npm run dev:admin    # :3002
-npm run dev:lp       # :3001
 npm run dev:worker   # worker（ポートなし）
 ```
 
@@ -316,12 +309,11 @@ npm run build
 pm2 start ecosystem.config.cjs
 ```
 
-`ecosystem.config.cjs` は `mvp-admin` / `mvp-lp` / `mvp-worker` の 3 プロセスを定義しています（さくらの VPS 等でのネイティブデプロイ想定）。各プロセスは npm スクリプト内の `dotenv-cli` 経由で直下の `.env` を読み込みます。
+`ecosystem.config.cjs` は `mvp-admin` / `mvp-worker` の 2 プロセスを定義しています（さくらの VPS 等でのネイティブデプロイ想定）。各プロセスは npm スクリプト内の `dotenv-cli` 経由で直下の `.env` を読み込みます。
 
 ```bash
 npm run start            # 全プロセス（concurrently）
 npm run start:admin      # :3002
-npm run start:lp         # :3001
 npm run start:worker     # worker
 ```
 
@@ -345,7 +337,7 @@ npm run start:worker     # worker
 | 症状 | 対処 |
 |---|---|
 | `prisma migrate` が advisory lock で失敗 | `DIRECT_URL` を pgbouncer 非経由（port 5432）の直結 URL に設定 |
-| ポート競合（`EADDRINUSE :3002` / `:3001`） | 既存プロセスを停止（`netstat` 等で PID 特定後に kill） |
+| ポート競合（`EADDRINUSE :3002`） | 既存プロセスを停止（`netstat` 等で PID 特定後に kill） |
 | AI 再送が動作しない | `ANTHROPIC_API_KEY` を設定。未設定時は AI 解析をスキップ |
 | CAPTCHA を突破できない | `TWOCAPTCHA_API_KEY` を設定。残高・対応種別を確認 |
 | フォーム送信が軒並み失敗 | プロキシ設定・送信先 URL の品質・Playwright ブラウザの導入を確認 |
